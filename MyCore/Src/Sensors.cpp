@@ -100,6 +100,81 @@ void ICM42688::process_in_task()
         xQueueSend(SensorsDataHub, &pkt, 0);
     }
 }
+MMC5983::MMC5983(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx, uint16_t i2c_addr)
+    : SensorBase(id, bus, tx, rx)
+{
+    // 配置 I2C 地址
+    // Datasheet Page 9: 7-bit address 0110000 (0x30)
+    // HAL库需要左移1位: 0x30 << 1 = 0x60
+    _config.i2c.addr = (i2c_addr << 1);
+}
+
+void MMC5983::init_regs()
+{
+    write_reg(MMC5983_REG_CTRL1, 0x80);
+    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
+    write_reg(MMC5983_REG_CTRL0, 0x20);
+    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
+    write_reg(MMC5983_REG_CTRL1, 0x00);
+    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
+    write_reg(MMC5983_REG_CTRL2, 0x0D);
+    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
+}
+void MMC5983::read_mag()
+{
+    // 直接发起 DMA 读取，读取 Xout0 开始的 7 个字节
+    // 这里不需要任何等待，调用完立即退出
+    read_regs(MMC5983_REG_XOUT0, 7);
+}
+void MMC5983::process_in_task()
+{
+
+    uint32_t x_raw = ((uint32_t)_rx_buf[0] << 10) |
+                     ((uint32_t)_rx_buf[1] << 2) |
+                     ((_rx_buf[6] & 0xC0) >> 6);
+
+    uint32_t y_raw = ((uint32_t)_rx_buf[2] << 10) |
+                     ((uint32_t)_rx_buf[3] << 2) |
+                     ((_rx_buf[6] & 0x30) >> 4);
+
+    uint32_t z_raw = ((uint32_t)_rx_buf[4] << 10) |
+                     ((uint32_t)_rx_buf[5] << 2) |
+                     ((_rx_buf[6] & 0x0C) >> 2);
+
+    // 注意：这里必须转为带符号浮点数
+    float x_gauss = ((float)x_raw - 131072.0f) / 16384.0f;
+    float y_gauss = ((float)y_raw - 131072.0f) / 16384.0f;
+    float z_gauss = ((float)z_raw - 131072.0f) / 16384.0f;
+
+    // 3. 数据打包 (填充父类定义的结构体)
+    Sensor_Packet_t packet;
+    packet.tag = _id;
+    // 获取当前时间戳 (假设 FreeRTOS tick)
+    packet.timestamp = xTaskGetTickCount();
+
+    packet.data.MMC5983.mag[0] = x_gauss;
+    packet.data.MMC5983.mag[1] = y_gauss;
+    packet.data.MMC5983.mag[2] = z_gauss;
+    if (SensorsDataHub != NULL) {
+        xQueueSend(SensorsDataHub, &packet, 0);
+    }
+}
+int32_t ICM42688::parse_20bit(uint8_t h, uint8_t l, uint8_t ext, uint8_t shift) 
+{
+    // 1. 拼接数据：[19:12]高位 | [11:4]中位 | [3:0]扩展位
+    // 逻辑：将高位左移 12 位，中位左移 4 位，并提取扩展字节中对应的 4 位低位
+    int32_t val = (int32_t)((h << 12) | (l << 4) | ((ext >> shift) & 0x0F));
+    
+    // 2. 符号扩展 (Sign Extension)
+    // ICM42688 的 20 位补码符号位在第 19 位 (即 0x80000)
+    // 如果该位为 1，说明是负数，需要将 32 位整型的高 12 位全部补 1
+    if (val & 0x80000) {
+        val |= 0xFFF00000;
+    }
+    
+    return val;
+}
+
 DPS310::DPS310(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
                GPIO_TypeDef *cs_port, uint16_t cs_pin)
     : SensorBase(id, bus, tx, rx)
@@ -210,65 +285,7 @@ float DPS310::compensate_temperature(int32_t raw_t)
     return (float)m_coeffs.c0 * 0.5f + (float)m_coeffs.c1 * t_sc;
 }
 
-MMC5983::MMC5983(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx, uint16_t i2c_addr)
-    : SensorBase(id, bus, tx, rx)
-{
-    // 配置 I2C 地址
-    // Datasheet Page 9: 7-bit address 0110000 (0x30)
-    // HAL库需要左移1位: 0x30 << 1 = 0x60
-    _config.i2c.addr = (i2c_addr << 1);
-}
 
-void MMC5983::init_regs()
-{
-    write_reg(MMC5983_REG_CTRL1, 0x80);
-    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
-    write_reg(MMC5983_REG_CTRL0, 0x20);
-    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
-    write_reg(MMC5983_REG_CTRL1, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
-    write_reg(MMC5983_REG_CTRL2, 0x0D);
-    vTaskDelay(pdMS_TO_TICKS(40)); // 等待复位完成 (Power on time is 10ms )
-}
-void MMC5983::read_mag()
-{
-    // 直接发起 DMA 读取，读取 Xout0 开始的 7 个字节
-    // 这里不需要任何等待，调用完立即退出
-    read_regs(MMC5983_REG_XOUT0, 7);
-}
-void MMC5983::process_in_task()
-{
-
-    uint32_t x_raw = ((uint32_t)_rx_buf[0] << 10) |
-                     ((uint32_t)_rx_buf[1] << 2) |
-                     ((_rx_buf[6] & 0xC0) >> 6);
-
-    uint32_t y_raw = ((uint32_t)_rx_buf[2] << 10) |
-                     ((uint32_t)_rx_buf[3] << 2) |
-                     ((_rx_buf[6] & 0x30) >> 4);
-
-    uint32_t z_raw = ((uint32_t)_rx_buf[4] << 10) |
-                     ((uint32_t)_rx_buf[5] << 2) |
-                     ((_rx_buf[6] & 0x0C) >> 2);
-
-    // 注意：这里必须转为带符号浮点数
-    float x_gauss = ((float)x_raw - 131072.0f) / 16384.0f;
-    float y_gauss = ((float)y_raw - 131072.0f) / 16384.0f;
-    float z_gauss = ((float)z_raw - 131072.0f) / 16384.0f;
-
-    // 3. 数据打包 (填充父类定义的结构体)
-    Sensor_Packet_t packet;
-    packet.tag = _id;
-    // 获取当前时间戳 (假设 FreeRTOS tick)
-    packet.timestamp = xTaskGetTickCount();
-
-    packet.data.MMC5983.mag[0] = x_gauss;
-    packet.data.MMC5983.mag[1] = y_gauss;
-    packet.data.MMC5983.mag[2] = z_gauss;
-    if (SensorsDataHub != NULL) {
-        xQueueSend(SensorsDataHub, &packet, 0);
-    }
-}
 
 // 第一阶段序列 (在 10ms 延时之前)
 const PMW3901::RegCfg PMW3901::opt_seq_part1[] = {
