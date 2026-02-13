@@ -45,9 +45,26 @@ extern DTCM_DATA MMC5983 mmc5983_sensor;
 extern DTCM_DATA DPS310 dps310_sensor;
 extern DTCM_DATA PMW3901 pmw3901_sensor;
 
-extern TaskHandle_t ICM42688TaskHandle;
+extern TaskHandle_t ICM42688ReadTaskHandle;
+extern TaskHandle_t ICM42688ProcessTaskHandle;
+extern TaskHandle_t MMC5983ReadTaskHandle;
+extern TaskHandle_t MMC5983ProcessTaskHandle;
+extern TaskHandle_t DPS310ReadTaskHandle;
+extern TaskHandle_t DPS310ProcessTaskHandle;
+extern TaskHandle_t PMW3901ReadTaskHandle;
+extern TaskHandle_t PMW3901ProcessTaskHandle;
+
+
 
 void SystemSensors_Init();                     // 初始化函数，负责创建初始化任务
 void SystemSensors_Init_Entry(void *argument); // 初始化任务，负责对总线和传感器进行初始化并创建读取和数据处理任务,以及姿态解算和控制任务
+void DPS310ReadTaskEntry(void *argument);         // DPS310 读取任务入口函数
+void DPS310ProcessTaskEntry(void *argument);      // DPS310 数据处理任务入口函数
+void PMW3901ReadTaskEntry(void *argument);       // PMW3901 读取任务入口函数
+void PMW3901ProcessTaskEntry(void *argument);    // PMW3901 数据处理任务入口函数
+void ICM42688ReadTaskEntry(void *argument);      // ICM42688 读取任务入口函数
+void ICM42688ProcessTaskEntry(void *argument);   // ICM42688 数据处理任务入口函数
+void MMC5983ReadTaskEntry(void *argument);      // MMC5983 读取任务入口函数
+void MMC5983ProcessTaskEntry(void *argument);   // MMC5983 数据处理任务入口函数
 
 #endif 
