@@ -6,7 +6,7 @@
 #include "string.h"
 #include "stdbool.h"
 
-#define AXI_SRAM  __attribute__((section(".ram_d1"))) alignas(32)
+#define AXI_SRAM __attribute__((aligned(32)))
 #define DTCM_DATA __attribute__((section(".dtcm_data"))) alignas(4)
 // 传感器 ID 枚举
 typedef enum {

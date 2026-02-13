@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "TaskConfig.hpp"
+#include"DTCMinit.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,7 +72,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  System_DTCM_Init(); // 初始化 DTCM 内存
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/

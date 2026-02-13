@@ -23,10 +23,12 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_8) {
-        BaseType_t xWoken = pdFALSE;
-        vTaskNotifyGiveFromISR(ICM42688ReadTaskHandle, &xWoken);
-        portYIELD_FROM_ISR(xWoken);
+        if (ICM42688ReadTaskHandle != NULL) 
+        {
+            BaseType_t xWoken = pdFALSE;
+            vTaskNotifyGiveFromISR(ICM42688ReadTaskHandle, &xWoken);
+            portYIELD_FROM_ISR(xWoken);
+        }
     }
 }
-
 } // extern "C" 结束

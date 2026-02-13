@@ -7,7 +7,10 @@ BusDriver::BusDriver() : lock(NULL), active_device(nullptr)
 
 void BusDriver::init()
 {
-    lock = xSemaphoreCreateMutex();
+    lock = xSemaphoreCreateBinary(); 
+    if (lock != NULL) {
+        xSemaphoreGive(lock); 
+    }
 }
 
 // SensorBase 实现
@@ -56,6 +59,7 @@ SPIBus::SPIBus(SPI_HandleTypeDef *h) : hspi(h)
 
 bool SPIBus::transfer(const DeviceConfig &cfg, uint8_t reg, uint8_t *tx, uint8_t *rx, uint16_t len, bool is_read)
 {
+    if (lock == NULL) return false;
     if (xSemaphoreTake(lock, pdMS_TO_TICKS(2)) != pdTRUE) return false;
 
     this->current_cfg = cfg;
