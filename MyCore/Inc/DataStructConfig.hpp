@@ -4,15 +4,17 @@
 #include "semphr.h"
 #include "cmsis_os2.h"
 #include "string.h"
-#define AXI_SRAM __attribute__((section(".ram_d1"))) alignas(32)
+#include "stdbool.h"
+
+#define AXI_SRAM  __attribute__((section(".ram_d1"))) alignas(32)
 #define DTCM_DATA __attribute__((section(".dtcm_data"))) alignas(4)
 // 传感器 ID 枚举
 typedef enum {
     SENSOR_ID_NONE = 0,
-    SENSOR_ID_ICM42688,
-    SENSOR_ID_MMC5983,
     SENSOR_ID_DPS310,
     SENSOR_ID_PMW3901,
+    SENSOR_ID_ICM42688,
+    SENSOR_ID_MMC5983,
     SENSOR_COUNT // 用于数组计数
 } SensorID_e;
 
@@ -22,16 +24,6 @@ typedef struct {
     uint32_t timestamp;
     union {
         struct {
-            float acc[3];  // 20-bit 扩展后
-            float gyro[3]; // 20-bit 扩展后
-            float temp_raw;
-        } ICM42688;
-
-        struct {
-            float mag[3];
-        } MMC5983;
-
-        struct {
             float pressure;
             float temperature;
         } DPS310;
@@ -40,7 +32,14 @@ typedef struct {
             float delta_y; // Y轴相对位移计数值
             float squal;   // 表面质量指标 (用于数据有效性过滤)
         } PMW3901;
-
+        struct {
+            float acc[3];  // 20-bit 扩展后
+            float gyro[3]; // 20-bit 扩展后
+            float temp_raw;
+        } ICM42688;
+        struct {
+            float mag[3];
+        } MMC5983;
     } data;
 } Sensor_Packet_t;
 
@@ -49,7 +48,7 @@ struct DeviceConfig {
         struct {
             GPIO_TypeDef *port;
             uint16_t pin;
-            bool read_sets_bit;     // 新增标志: true = 读置1/写清0 (标准); false = 读清0/写置1 (PMW3901)
+            bool read_sets_bit; // 新增标志: true = 读置1/写清0 (标准); false = 读清0/写置1 (PMW3901)
         } spi;
         struct {
             uint16_t addr;
@@ -83,25 +82,31 @@ public:
 // ==========================================
 // 传感器基类
 // ==========================================
-class SensorBase {
+class SensorBase
+{
 protected:
     // 家族遗产：子类直接使用
-    SensorID_e    _id;
-    BusDriver* _bus;
-    uint8_t* _tx_buf;
-    uint8_t* _rx_buf;
-    DeviceConfig  _config;
-    TaskHandle_t  _data_task_handle = nullptr; // 存储对应的处理任务句柄
+    SensorID_e _id;
+    BusDriver *_bus;
+    uint8_t *_tx_buf;
+    uint8_t *_rx_buf;
+    DeviceConfig _config;
+    TaskHandle_t _data_task_handle = nullptr; // 存储对应的处理任务句柄
 
 public:
-    SensorBase(SensorID_e id, BusDriver* bus, uint8_t* tx, uint8_t* rx);
-    virtual ~SensorBase() {}
+    SensorBase(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx);
+    virtual ~SensorBase()
+    {
+    }
 
     bool read_regs(uint8_t reg, uint16_t len);
     bool write_reg(uint8_t reg, uint8_t val);
     bool write_regs(uint8_t reg, uint8_t *data, uint16_t len);
-    void set_task_handle(TaskHandle_t handle) { _data_task_handle = handle; }//绑定唤醒任务句柄
-    virtual void notify_task_ISR();//
+    void set_task_handle(TaskHandle_t handle)
+    {
+        _data_task_handle = handle;
+    } // 绑定唤醒任务句柄
+    virtual void notify_task_ISR(); //
     virtual void process_in_task() = 0;
 };
 

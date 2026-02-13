@@ -1,10 +1,29 @@
 #pragma once
 
-
 #include "main.h"
 #include "i2c.h"
 #include "spi.h"
 #include "DataStructConfig.hpp"
+
+#define DPS310_PRS_B2     0x00
+#define DPS310_TMP_B2     0x03
+#define DPS310_PRS_CFG    0x06
+#define DPS310_TMP_CFG    0x07
+#define DPS310_MEAS_CFG   0x08
+#define DPS310_CFG_REG    0x09
+#define DPS310_RESET      0x0C
+#define DPS310_COEF_START 0x10
+#define DPS310_COEF_SRCE  0x28
+/*--------------------------------------*DPS310regmap*--------------------------------------*/
+
+#define PMW3901_REG_ID             0x00
+#define PMW3901_REG_MOTION         0x02
+#define PMW3901_REG_DELTA_X_L      0x03
+#define PMW3901_REG_MOTION_BURST   0x16
+#define PMW3901_REG_POWER_UP_RESET 0x3A
+
+#define W(reg)                     ((reg) | 0x80) // PMW辅助写入宏
+/*--------------------------------------*PMW3901regmap*--------------------------------------*/
 
 #define ICM42688_DEVICE_CONFIG_ADDR 0x11 // 软复位与 SPI 模式配置
 #define ICM42688_INT_CONFIG_ADDR    0x14 // INT1/INT2 引脚电平与模式配置
@@ -29,48 +48,6 @@
 #define MMC5983_REG_PRODUCT_ID 0x2F
 /*--------------------------------------*MMC5983regmap*--------------------------------------*/
 
-#define DPS310_PRS_B2     0x00
-#define DPS310_TMP_B2     0x03
-#define DPS310_PRS_CFG    0x06
-#define DPS310_TMP_CFG    0x07
-#define DPS310_MEAS_CFG   0x08
-#define DPS310_CFG_REG    0x09
-#define DPS310_RESET      0x0C
-#define DPS310_COEF_START 0x10
-#define DPS310_COEF_SRCE  0x28
-/*--------------------------------------*DPS310regmap*--------------------------------------*/
-
-#define PMW3901_REG_ID             0x00
-#define PMW3901_REG_MOTION         0x02
-#define PMW3901_REG_DELTA_X_L      0x03
-#define PMW3901_REG_MOTION_BURST   0x16
-#define PMW3901_REG_POWER_UP_RESET 0x3A
-
-#define W(reg) ((reg) | 0x80)//PMW辅助写入宏
-/*--------------------------------------*PMW3901regmap*--------------------------------------*/
-
-class ICM42688 : public SensorBase
-{
-public:
-    ICM42688(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
-             GPIO_TypeDef *cs_port, uint16_t cs_pin);
-    void init_regs();
-    void read_fifo();
-    void process_in_task() override;
-private:
-    int32_t parse_20bit(uint8_t h, uint8_t l, uint8_t ext, uint8_t shift);
-};
-
-// --- MMC5983 (I2C) ---
-class MMC5983 : public SensorBase
-{
-public:
-    MMC5983(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx, uint16_t i2c_addr);
-    void init_regs();
-    void read_mag();
-    void process_in_task() override;
-};
-
 class DPS310 : public SensorBase
 {
 public:
@@ -79,6 +56,7 @@ public:
     void init_regs(); // 初始化任务中调用
     void read_data(); // 周期性调用 (如 32Hz)
     void process_in_task() override;
+
 private:
     struct Coeffs {
         int32_t c0, c1;
@@ -100,8 +78,8 @@ public:
             GPIO_TypeDef *cs_port, uint16_t cs_pin);
 
     // 接口函数
-    void init_regs();           // 初始化序列
-    void read_data();           // 触发 Burst 读取
+    void init_regs();                // 初始化序列
+    void read_data();                // 触发 Burst 读取
     void process_in_task() override; // 数据解析
 
 private:
@@ -116,5 +94,27 @@ private:
     static const RegCfg opt_seq_part2[];
 
     // 批量写入辅助函数
-    void write_block(const RegCfg* seq, size_t len);
+    void write_block(const RegCfg *seq, size_t len);
+};
+
+class ICM42688 : public SensorBase
+{
+public:
+    ICM42688(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
+             GPIO_TypeDef *cs_port, uint16_t cs_pin);
+    void init_regs();
+    void read_fifo();
+    void process_in_task() override;
+
+private:
+    int32_t parse_20bit(uint8_t h, uint8_t l, uint8_t ext, uint8_t shift);
+};
+// --- MMC5983 (I2C) ---
+class MMC5983 : public SensorBase
+{
+public:
+    MMC5983(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx, uint16_t i2c_addr);
+    void init_regs();
+    void read_mag();
+    void process_in_task() override;
 };

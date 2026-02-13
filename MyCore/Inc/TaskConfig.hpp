@@ -1,21 +1,30 @@
 #pragma once
+#include "main.h" 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#include"main.h"
-#include"FreeRTOS.h"
-#include"task.h"
-#include"spi.h"
-#include"i2c.h"
-#include"QueueConfig.hpp"
-#include"Sensors.hpp"
-#include"DataStructConfig.hpp"
-#include"DTCMinit.hpp"
-#include"Mydelay.hpp"
+void Bridge_SystemSensors_Init(void); // 
 
+#ifdef __cplusplus
+}
+#endif
 
+#ifdef __cplusplus
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "spi.h"
+#include "i2c.h"
+#include "QueueConfig.hpp"
+#include "Sensors.hpp"
+#include "DataStructConfig.hpp"
+#include "DTCMinit.hpp"
+#include "Mydelay.hpp"
 #define ICM42688_Buffer_Length 32
-#define MMC5983_Buffer_Length 32
-#define DPS310_Buffer_Length 32
-#define PMW3901_Buffer_Length 32
+#define MMC5983_Buffer_Length  32
+#define DPS310_Buffer_Length   32
+#define PMW3901_Buffer_Length  32
 
 extern DTCM_DATA SPIBus spi1_bus;
 extern DTCM_DATA SPIBus spi2_bus;
@@ -36,6 +45,9 @@ extern DTCM_DATA MMC5983 mmc5983_sensor;
 extern DTCM_DATA DPS310 dps310_sensor;
 extern DTCM_DATA PMW3901 pmw3901_sensor;
 
+extern TaskHandle_t ICM42688TaskHandle;
 
-void SystemSensors_Init();
-void SystemSensors_Init_Entry(void *argument);
+void SystemSensors_Init();                     // 初始化函数，负责创建初始化任务
+void SystemSensors_Init_Entry(void *argument); // 初始化任务，负责对总线和传感器进行初始化并创建读取和数据处理任务,以及姿态解算和控制任务
+
+#endif 

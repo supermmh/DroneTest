@@ -63,8 +63,12 @@ void Error_Handler(void);
 #define GND4_GPIO_Port GPIOC
 #define DPS310_NCS_Pin GPIO_PIN_4
 #define DPS310_NCS_GPIO_Port GPIOA
+#define DPS310_Pin GPIO_PIN_5
+#define DPS310_GPIO_Port GPIOA
 #define PMW3901_NCS_Pin GPIO_PIN_12
 #define PMW3901_NCS_GPIO_Port GPIOB
+#define PMW3901_Pin GPIO_PIN_13
+#define PMW3901_GPIO_Port GPIOB
 #define GND2_Pin GPIO_PIN_6
 #define GND2_GPIO_Port GPIOC
 #define VCC2_Pin GPIO_PIN_7
@@ -80,6 +84,8 @@ void Error_Handler(void);
 #define VCC1_GPIO_Port GPIOA
 #define GND1_Pin GPIO_PIN_12
 #define GND1_GPIO_Port GPIOA
+#define ICM42688_Pin GPIO_PIN_10
+#define ICM42688_GPIO_Port GPIOC
 #define ICM42688_NCS_Pin GPIO_PIN_2
 #define ICM42688_NCS_GPIO_Port GPIOD
 

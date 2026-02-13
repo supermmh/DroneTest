@@ -31,7 +31,7 @@ void SensorBase::notify_task_ISR()
 
 bool SensorBase::read_regs(uint8_t reg, uint16_t len)
 {
-    _bus->active_device = this; // 👈 告知总线当前使用者
+    _bus->active_device = this; //  告知总线当前使用者
     return _bus->transfer(_config, reg, _tx_buf, _rx_buf, len, true);
 }
 
@@ -40,7 +40,7 @@ bool SensorBase::write_regs(uint8_t reg, uint8_t *data, uint16_t len)
     _bus->active_device = this;
     if (len > 30) return false;
 
-    // 借用 rx_buf 暂存数据，因为 DMA 需要稳定的地址
+    // 借用 rx_buf 暂存数据，根据子类中的通信协议传入_tx_buf
     memcpy(_rx_buf, data, len);
     return _bus->transfer(_config, reg, _tx_buf, _rx_buf, len, false);
 }

@@ -1,4 +1,6 @@
-#include "Callback.hpp"
+#include "TaskConfig.hpp"
+#include "main.h"
+extern "C" {
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
@@ -17,3 +19,14 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
         i2c1_bus.irq_handler();
     }
 }
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_8) {
+        BaseType_t xWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(ICM42688TaskHandle, &xWoken);
+        portYIELD_FROM_ISR(xWoken);
+    }
+}
+
+} // extern "C" 结束
