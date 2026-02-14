@@ -1,5 +1,5 @@
 #include "TaskConfig.hpp"
-
+#include "DebugMonitor.hpp"
 SPIBus spi1_bus(&hspi1);
 SPIBus spi2_bus(&hspi2);
 SPIBus spi3_bus(&hspi3);
@@ -42,7 +42,7 @@ MMC5983 mmc5983_sensor(
     MMC5983RxBuffer,
     0x30);
 
-DTCM_DATA StackType_t ICM42688ReadTaskStack[256];
+DTCM_DATA StackType_t ICM42688ReadTaskStack[1024];
 DTCM_DATA StaticTask_t ICM42688ReadTaskTCB;
 TaskHandle_t ICM42688ReadTaskHandle = NULL;
 
@@ -50,7 +50,7 @@ DTCM_DATA StackType_t ICM42688ProcessTaskStack[1024];
 DTCM_DATA StaticTask_t ICM42688ProcessTaskTCB;
 TaskHandle_t ICM42688ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t MMC5983ReadTaskStack[256];
+DTCM_DATA StackType_t MMC5983ReadTaskStack[1024];
 DTCM_DATA StaticTask_t MMC5983ReadTaskTCB;
 TaskHandle_t MMC5983ReadTaskHandle = NULL;
 
@@ -58,7 +58,7 @@ DTCM_DATA StackType_t MMC5983ProcessTaskStack[1024];
 DTCM_DATA StaticTask_t MMC5983ProcessTaskTCB;
 TaskHandle_t MMC5983ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t DPS310ReadTaskStack[256];
+DTCM_DATA StackType_t DPS310ReadTaskStack[1024];
 DTCM_DATA StaticTask_t DPS310ReadTaskTCB;
 TaskHandle_t DPS310ReadTaskHandle = NULL;
 
@@ -66,7 +66,7 @@ DTCM_DATA StackType_t DPS310ProcessTaskStack[1024];
 DTCM_DATA StaticTask_t DPS310ProcessTaskTCB;
 TaskHandle_t DPS310ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t PMW3901ReadTaskStack[256];
+DTCM_DATA StackType_t PMW3901ReadTaskStack[1024];
 DTCM_DATA StaticTask_t PMW3901ReadTaskTCB;
 TaskHandle_t PMW3901ReadTaskHandle = NULL;
 
@@ -86,7 +86,7 @@ void SystemSensors_Init()
     xTaskCreate(
         SystemSensors_Init_Entry,
         "SensorInit",
-        512,
+        1024,
         NULL,
         configMAX_PRIORITIES - 1,
         NULL);
@@ -107,7 +107,7 @@ void SystemSensors_Init_Entry(void *argument)
     mmc5983_sensor.init_regs();
 
     ICM42688ReadTaskHandle = xTaskCreateStatic(
-        ICM42688ReadTaskEntry, "ICM42688Read", 256, NULL,
+        ICM42688ReadTaskEntry, "ICM42688Read", 1024, NULL,
         configMAX_PRIORITIES - 2, // 读取最高
         ICM42688ReadTaskStack, &ICM42688ReadTaskTCB);
 
@@ -118,7 +118,7 @@ void SystemSensors_Init_Entry(void *argument)
 
     // --- 导航：PMW3901 光流 (较高优先级) ---
     PMW3901ReadTaskHandle = xTaskCreateStatic(
-        PMW3901ReadTaskEntry, "PMW3901Read", 256, NULL,
+        PMW3901ReadTaskEntry, "PMW3901Read", 1024, NULL,
         configMAX_PRIORITIES - 4,
         PMW3901ReadTaskStack, &PMW3901ReadTaskTCB);
 
@@ -129,7 +129,7 @@ void SystemSensors_Init_Entry(void *argument)
 
     // --- 辅助：MMC5983 磁力计 (中等优先级) ---
     MMC5983ReadTaskHandle = xTaskCreateStatic(
-        MMC5983ReadTaskEntry, "MMC5983Read", 256, NULL,
+        MMC5983ReadTaskEntry, "MMC5983Read", 1024, NULL,
         configMAX_PRIORITIES - 6,
         MMC5983ReadTaskStack, &MMC5983ReadTaskTCB);
 
@@ -140,7 +140,7 @@ void SystemSensors_Init_Entry(void *argument)
 
     // --- 辅助：DPS310 气压计 (中等优先级) ---
     DPS310ReadTaskHandle = xTaskCreateStatic(
-        DPS310ReadTaskEntry, "DPS310Read", 256, NULL,
+        DPS310ReadTaskEntry, "DPS310Read", 1024, NULL,
         configMAX_PRIORITIES - 6, // 气压和磁力计同一级别即可
         DPS310ReadTaskStack, &DPS310ReadTaskTCB);
 
@@ -158,6 +158,7 @@ void SystemSensors_Init_Entry(void *argument)
     mmc5983_sensor.set_task_handle(MMC5983ProcessTaskHandle);
 
     SystemQueueInit();
+    DBG_MON_INIT();
     // 5. 初始化完毕，释放内存
     vTaskDelete(NULL);
 }
@@ -167,7 +168,11 @@ void DPS310ReadTaskEntry(void *argument)
     TickType_t xLastWakeTime    = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(10); // 100Hz
     while (1) {
-        dps310_sensor.read_data();
+        DBG_MON_ATTEMPT(SENSOR_ID_DPS310);
+
+        if (!dps310_sensor.read_data()) {
+            DBG_MON_ERROR(SENSOR_ID_DPS310);
+        }
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 } // DPS310 读取任务入口函数
@@ -184,7 +189,10 @@ void PMW3901ReadTaskEntry(void *argument)
     TickType_t xLastWakeTime    = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50Hz
     while (1) {
-        pmw3901_sensor.read_data();
+        DBG_MON_ATTEMPT(SENSOR_ID_PMW3901);
+        if (!pmw3901_sensor.read_data()) {
+            DBG_MON_ERROR(SENSOR_ID_PMW3901);
+        }
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 
@@ -201,7 +209,10 @@ void ICM42688ReadTaskEntry(void *argument)
 {
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        icm42688_sensor.read_fifo();
+        DBG_MON_ATTEMPT(SENSOR_ID_ICM42688);
+        if (!icm42688_sensor.read_fifo()) {
+            DBG_MON_ERROR(SENSOR_ID_ICM42688);
+        }
     }
 
 } // ICM42688 读取任务入口函数
@@ -219,7 +230,10 @@ void MMC5983ReadTaskEntry(void *argument)
     TickType_t xLastWakeTime    = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50Hz
     while (1) {
-        mmc5983_sensor.read_mag();
+        DBG_MON_ATTEMPT(SENSOR_ID_MMC5983);
+        if (!mmc5983_sensor.read_mag()) {
+            DBG_MON_ERROR(SENSOR_ID_MMC5983);
+        }
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 

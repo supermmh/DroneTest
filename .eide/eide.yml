@@ -41,7 +41,7 @@ targets:
       GCC:
         archExtensions: ""
         cpuType: Cortex-M7
-        floatingPointHardware: double
+        floatingPointHardware: single
         options:
           version: 5
           afterBuildTasks: []
@@ -84,7 +84,7 @@ targets:
           vendor: ST
         otherCmds: ""
         proType: 1
-        speed: 1000
+        speed: 8000
     uploader: JLink
   Release:
     cppPreprocessAttrs:
@@ -147,8 +147,8 @@ targets:
         baseAddr: ""
         bin: ""
         cpuInfo:
-          cpuName: "null"
-          vendor: "null"
+          cpuName: STM32H743VI
+          vendor: ST
         otherCmds: ""
         proType: 1
         speed: 8000

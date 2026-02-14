@@ -6,7 +6,7 @@
 #include "string.h"
 #include "stdbool.h"
 
-#define AXI_SRAM __attribute__((aligned(32)))
+#define AXI_SRAM  __attribute__((aligned(32)))
 #define DTCM_DATA __attribute__((section(".dtcm_data"))) alignas(4)
 // 传感器 ID 枚举
 typedef enum {
@@ -63,7 +63,7 @@ class BusDriver
 public:
     SemaphoreHandle_t lock;
     SensorBase *active_device;
-
+    bool is_read_op;
     BusDriver();
     virtual void init(); // 创建互斥量
 

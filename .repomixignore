@@ -1,0 +1,28 @@
+# 忽略编译产物、二进制和链接文件
+MDK-ARM/
+Debug/
+Release/
+build/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.axf
+
+# 忽略 ST 官方标准底层库 (AI 早就学过了，不需要再看一遍)
+Drivers/STM32H7xx_HAL_Driver/
+Drivers/CMSIS/
+
+# 忽略 FreeRTOS 官方底层源码 (仅保留你的应用层逻辑即可)
+Middlewares/Third_Party/FreeRTOS/Source/
+
+# 忽略 IDE 缓存和隐藏配置
+.settings/
+.vscode/
+.idea/
+*.uvoptx
+*.uvprojx
+*.launch
+.DS_Store

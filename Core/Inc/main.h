@@ -31,7 +31,9 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+extern volatile float Mag_Gauss_x;
+extern volatile float Mag_Gauss_y;
+extern volatile float Mag_Gauss_z;
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/

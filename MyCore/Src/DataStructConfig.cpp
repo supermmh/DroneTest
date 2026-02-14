@@ -1,15 +1,15 @@
 #include "DataStructConfig.hpp"
 
 // BusDriver 实现
-BusDriver::BusDriver() : lock(NULL), active_device(nullptr)
+BusDriver::BusDriver() : lock(NULL), active_device(nullptr), is_read_op(false)
 {
 }
 
 void BusDriver::init()
 {
-    lock = xSemaphoreCreateBinary(); 
+    lock = xSemaphoreCreateBinary();
     if (lock != NULL) {
-        xSemaphoreGive(lock); 
+        xSemaphoreGive(lock);
     }
 }
 
@@ -63,19 +63,19 @@ bool SPIBus::transfer(const DeviceConfig &cfg, uint8_t reg, uint8_t *tx, uint8_t
     if (xSemaphoreTake(lock, pdMS_TO_TICKS(2)) != pdTRUE) return false;
 
     this->current_cfg = cfg;
-
-if (is_read) {
+    this->is_read_op  = is_read;
+    if (is_read) {
         if (cfg.spi.read_sets_bit) {
-            tx[0] = reg | 0x80;    // 标准模式 (ICM42688): Read = 1
+            tx[0] = reg | 0x80; // 标准模式 (ICM42688): Read = 1
         } else {
-            tx[0] = reg & 0x7F;    // 反向模式 (PMW3901): Read = 0
+            tx[0] = reg & 0x7F; // 反向模式 (PMW3901): Read = 0
         }
         memset(&tx[1], 0, len);
     } else {
         if (cfg.spi.read_sets_bit) {
-            tx[0] = reg & 0x7F;    // 标准模式: Write = 0
+            tx[0] = reg & 0x7F; // 标准模式: Write = 0
         } else {
-            tx[0] = reg | 0x80;    // 反向模式: Write = 1
+            tx[0] = reg | 0x80; // 反向模式: Write = 1
         }
         memcpy(&tx[1], rx, len);
     }
@@ -95,7 +95,9 @@ if (is_read) {
 void SPIBus::irq_handler()
 {
     HAL_GPIO_WritePin(current_cfg.spi.port, current_cfg.spi.pin, GPIO_PIN_SET);
-    if (active_device) active_device->notify_task_ISR();
+    if (active_device && is_read_op) {
+        active_device->notify_task_ISR();
+    }
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xSemaphoreGiveFromISR(lock, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
@@ -108,7 +110,7 @@ I2CBus::I2CBus(I2C_HandleTypeDef *h) : hi2c(h)
 bool I2CBus::transfer(const DeviceConfig &cfg, uint8_t reg, uint8_t *tx, uint8_t *rx, uint16_t len, bool is_read)
 {
     if (xSemaphoreTake(lock, pdMS_TO_TICKS(5)) != pdTRUE) return false;
-
+    this->is_read_op = is_read;
     if (is_read) {
         SCB_InvalidateDCache_by_Addr((uint32_t *)rx, 32);
         if (HAL_I2C_Mem_Read_DMA(hi2c, cfg.i2c.addr, reg, I2C_MEMADD_SIZE_8BIT, rx, len) != HAL_OK) {
@@ -128,7 +130,9 @@ bool I2CBus::transfer(const DeviceConfig &cfg, uint8_t reg, uint8_t *tx, uint8_t
 
 void I2CBus::irq_handler()
 {
-    if (active_device) active_device->notify_task_ISR();
+    if (active_device && is_read_op) {
+        active_device->notify_task_ISR();
+    }
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xSemaphoreGiveFromISR(lock, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);

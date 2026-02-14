@@ -36,6 +36,8 @@
 #define ICM42688_WHO_AM_I_ADDR      0x75 // 器件ID验证 (应返回 0x47)
 #define ICM42688_INTF_CONFIG5_ADDR  0x7B // 配置引脚 9 为 CLKIN (外部时钟输入)
 #define ICM42688_REG_BANK_SEL_ADDR  0x76 // 切换 Bank 0/1/2/3/4
+#define ICM42688_FIFO_CONFIG_ADDR   0x16
+#define ICM42688_INT_CONFIG1_ADDR   0x64
 
 /*--------------------------------------*ICM42688regmap*--------------------------------------*/
 
@@ -54,7 +56,7 @@ public:
     DPS310(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
            GPIO_TypeDef *cs_port, uint16_t cs_pin);
     void init_regs(); // 初始化任务中调用
-    void read_data(); // 周期性调用 (如 32Hz)
+    bool read_data(); // 周期性调用 (如 32Hz)
     void process_in_task() override;
 
 private:
@@ -79,7 +81,7 @@ public:
 
     // 接口函数
     void init_regs();                // 初始化序列
-    void read_data();                // 触发 Burst 读取
+    bool read_data();                // 触发 Burst 读取
     void process_in_task() override; // 数据解析
 
 private:
@@ -103,7 +105,7 @@ public:
     ICM42688(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
              GPIO_TypeDef *cs_port, uint16_t cs_pin);
     void init_regs();
-    void read_fifo();
+    bool read_fifo();
     void process_in_task() override;
 
 private:
@@ -115,6 +117,6 @@ class MMC5983 : public SensorBase
 public:
     MMC5983(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx, uint16_t i2c_addr);
     void init_regs();
-    void read_mag();
+    bool read_mag();
     void process_in_task() override;
 };
