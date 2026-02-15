@@ -21,7 +21,7 @@ typedef enum {
 // 传感器数据包结构 (推送到队列的数据)
 typedef struct {
     SensorID_e tag;
-    uint32_t timestamp;
+    uint64_t timestamp;
     union {
         struct {
             float pressure;

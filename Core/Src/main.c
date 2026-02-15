@@ -22,11 +22,13 @@
 #include "dma.h"
 #include "i2c.h"
 #include "spi.h"
+#include "tim.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "DTCMinit.h"
+#include "Mydelay.hpp"
 #include "TaskConfig.hpp"
 /* USER CODE END Includes */
 
@@ -42,9 +44,9 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-volatile float Mag_Gauss_x=0;
-volatile float Mag_Gauss_y=0;
-volatile float Mag_Gauss_z=0;
+volatile float Mag_Gauss_x = 0;
+volatile float Mag_Gauss_y = 0;
+volatile float Mag_Gauss_z = 0;
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -101,16 +103,18 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+    DWT_Time_Init(); // 初始化 DWT 计数器和保活机制
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_I2C1_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
   MX_SPI3_Init();
+  MX_TIM2_Init();
+  MX_TIM4_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
     Bridge_SystemSensors_Init(); // 初始化传感器系统
   /* USER CODE END 2 */

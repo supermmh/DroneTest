@@ -1,6 +1,7 @@
 #include "Sensors.hpp"
 #include "QueueConfig.hpp"
 #include "DebugMonitor.hpp"
+#include "Mydelay.hpp"
 DPS310::DPS310(SensorID_e id, BusDriver *bus, uint8_t *tx, uint8_t *rx,
                GPIO_TypeDef *cs_port, uint16_t cs_pin)
     : SensorBase(id, bus, tx, rx)
@@ -81,9 +82,9 @@ void DPS310::process_in_task()
     float temperature = compensate_temperature(raw_t);
 
     packet.tag                     = _id;
-    packet.timestamp               = xTaskGetTickCount(); // 或者使用微秒级时间戳
-    packet.data.DPS310.pressure    = pressure;            // 单位: Pa
-    packet.data.DPS310.temperature = temperature;         // 单位: Celsius
+    packet.timestamp               = Get_System_Time_ns(); // 或者使用微秒级时间戳
+    packet.data.DPS310.pressure    = pressure;             // 单位: Pa
+    packet.data.DPS310.temperature = temperature;          // 单位: Celsius
 
     // 4. 推送到队列 (非阻塞发送，保持实时性)
     if (SensorsDataHub != NULL) {
@@ -241,7 +242,7 @@ void PMW3901::process_in_task()
     int16_t raw_dy              = (int16_t)(p[4] | (p[5] << 8));
     uint8_t squal               = p[6];
     packet.tag                  = _id;
-    packet.timestamp            = xTaskGetTickCount();
+    packet.timestamp            = Get_System_Time_ns();
     packet.data.PMW3901.delta_x = (float)raw_dx;
     packet.data.PMW3901.delta_y = (float)raw_dy;
     packet.data.PMW3901.squal   = (float)squal; // 表面纹理质量
@@ -272,11 +273,11 @@ void ICM42688::init_regs()
     vTaskDelay(pdMS_TO_TICKS(40));
 
     // 4. 配置 ODR 和量程
-    // 陀螺仪: 2000dps, 32kHz (0x01)
+    // 陀螺仪: 2000dps, 1kHz (0x01)
     write_reg(ICM42688_GYRO_CONFIG0_ADDR, 0x06);
     vTaskDelay(pdMS_TO_TICKS(40));
 
-    // 加速计: 16g, 32kHz (0x01)
+    // 加速计: 16g, 1kHz (0x01)
     write_reg(ICM42688_ACCEL_CONFIG0_ADDR, 0x06);
     vTaskDelay(pdMS_TO_TICKS(40));
 
@@ -336,7 +337,7 @@ void ICM42688::process_in_task()
 
     /* 物理量转换逻辑 */
     packet.tag       = _id;
-    packet.timestamp = xTaskGetTickCount(); // 使用 DWT 周期计数器作为高精度时间戳
+    packet.timestamp = Get_System_Time_ns(); // 使用 DWT 周期计数器作为高精度时间戳
     // 加速度计：20-bit 模式下，±16g 量程的灵敏度为 8192 LSB/g
     packet.data.ICM42688.acc[0] = (float)raw_ax / 32768.0f;
     packet.data.ICM42688.acc[1] = (float)raw_ay / 32768.0f;
@@ -428,7 +429,7 @@ void MMC5983::process_in_task()
     Sensor_Packet_t packet;
     packet.tag = _id;
     // 获取当前时间戳 (假设 FreeRTOS tick)
-    packet.timestamp = xTaskGetTickCount();
+    packet.timestamp = Get_System_Time_ns();
 
     packet.data.MMC5983.mag[0] = x_gauss;
     packet.data.MMC5983.mag[1] = y_gauss;

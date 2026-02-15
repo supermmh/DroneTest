@@ -42,35 +42,35 @@ MMC5983 mmc5983_sensor(
     MMC5983RxBuffer,
     0x30);
 
-DTCM_DATA StackType_t ICM42688ReadTaskStack[1024];
+DTCM_DATA StackType_t ICM42688ReadTaskStack[128];
 DTCM_DATA StaticTask_t ICM42688ReadTaskTCB;
 TaskHandle_t ICM42688ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t ICM42688ProcessTaskStack[1024];
+DTCM_DATA StackType_t ICM42688ProcessTaskStack[128];
 DTCM_DATA StaticTask_t ICM42688ProcessTaskTCB;
 TaskHandle_t ICM42688ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t MMC5983ReadTaskStack[1024];
+DTCM_DATA StackType_t MMC5983ReadTaskStack[128];
 DTCM_DATA StaticTask_t MMC5983ReadTaskTCB;
 TaskHandle_t MMC5983ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t MMC5983ProcessTaskStack[1024];
+DTCM_DATA StackType_t MMC5983ProcessTaskStack[128];
 DTCM_DATA StaticTask_t MMC5983ProcessTaskTCB;
 TaskHandle_t MMC5983ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t DPS310ReadTaskStack[1024];
+DTCM_DATA StackType_t DPS310ReadTaskStack[128];
 DTCM_DATA StaticTask_t DPS310ReadTaskTCB;
 TaskHandle_t DPS310ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t DPS310ProcessTaskStack[1024];
+DTCM_DATA StackType_t DPS310ProcessTaskStack[128];
 DTCM_DATA StaticTask_t DPS310ProcessTaskTCB;
 TaskHandle_t DPS310ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t PMW3901ReadTaskStack[1024];
+DTCM_DATA StackType_t PMW3901ReadTaskStack[128];
 DTCM_DATA StaticTask_t PMW3901ReadTaskTCB;
 TaskHandle_t PMW3901ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t PMW3901ProcessTaskStack[1024];
+DTCM_DATA StackType_t PMW3901ProcessTaskStack[128];
 DTCM_DATA StaticTask_t PMW3901ProcessTaskTCB;
 TaskHandle_t PMW3901ProcessTaskHandle = NULL;
 
@@ -86,7 +86,7 @@ void SystemSensors_Init()
     xTaskCreate(
         SystemSensors_Init_Entry,
         "SensorInit",
-        1024,
+        256,
         NULL,
         configMAX_PRIORITIES - 1,
         NULL);
@@ -107,45 +107,45 @@ void SystemSensors_Init_Entry(void *argument)
     mmc5983_sensor.init_regs();
 
     ICM42688ReadTaskHandle = xTaskCreateStatic(
-        ICM42688ReadTaskEntry, "ICM42688Read", 1024, NULL,
+        ICM42688ReadTaskEntry, "ICM42688Read", 128, NULL,
         configMAX_PRIORITIES - 2, // 读取最高
         ICM42688ReadTaskStack, &ICM42688ReadTaskTCB);
 
     ICM42688ProcessTaskHandle = xTaskCreateStatic(
-        ICM42688ProcessTaskEntry, "ICM42688Proc", 1024, NULL,
+        ICM42688ProcessTaskEntry, "ICM42688Proc", 128, NULL,
         configMAX_PRIORITIES - 3, // 解析紧随其后
         ICM42688ProcessTaskStack, &ICM42688ProcessTaskTCB);
 
     // --- 导航：PMW3901 光流 (较高优先级) ---
     PMW3901ReadTaskHandle = xTaskCreateStatic(
-        PMW3901ReadTaskEntry, "PMW3901Read", 1024, NULL,
+        PMW3901ReadTaskEntry, "PMW3901Read", 128, NULL,
         configMAX_PRIORITIES - 4,
         PMW3901ReadTaskStack, &PMW3901ReadTaskTCB);
 
     PMW3901ProcessTaskHandle = xTaskCreateStatic(
-        PMW3901ProcessTaskEntry, "PMW3901Proc", 1024, NULL,
+        PMW3901ProcessTaskEntry, "PMW3901Proc", 128, NULL,
         configMAX_PRIORITIES - 5,
         PMW3901ProcessTaskStack, &PMW3901ProcessTaskTCB);
 
     // --- 辅助：MMC5983 磁力计 (中等优先级) ---
     MMC5983ReadTaskHandle = xTaskCreateStatic(
-        MMC5983ReadTaskEntry, "MMC5983Read", 1024, NULL,
+        MMC5983ReadTaskEntry, "MMC5983Read", 128, NULL,
         configMAX_PRIORITIES - 6,
         MMC5983ReadTaskStack, &MMC5983ReadTaskTCB);
 
     MMC5983ProcessTaskHandle = xTaskCreateStatic(
-        MMC5983ProcessTaskEntry, "MMC5983Proc", 1024, NULL,
+        MMC5983ProcessTaskEntry, "MMC5983Proc", 128, NULL,
         configMAX_PRIORITIES - 7,
         MMC5983ProcessTaskStack, &MMC5983ProcessTaskTCB);
 
     // --- 辅助：DPS310 气压计 (中等优先级) ---
     DPS310ReadTaskHandle = xTaskCreateStatic(
-        DPS310ReadTaskEntry, "DPS310Read", 1024, NULL,
+        DPS310ReadTaskEntry, "DPS310Read", 128, NULL,
         configMAX_PRIORITIES - 6, // 气压和磁力计同一级别即可
         DPS310ReadTaskStack, &DPS310ReadTaskTCB);
 
     DPS310ProcessTaskHandle = xTaskCreateStatic(
-        DPS310ProcessTaskEntry, "DPS310Proc", 1024, NULL,
+        DPS310ProcessTaskEntry, "DPS310Proc", 128, NULL,
         configMAX_PRIORITIES - 7,
         DPS310ProcessTaskStack, &DPS310ProcessTaskTCB);
 

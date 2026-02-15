@@ -59,10 +59,14 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define VCC4_Pin GPIO_PIN_2
-#define VCC4_GPIO_Port GPIOC
-#define GND4_Pin GPIO_PIN_3
-#define GND4_GPIO_Port GPIOC
+#define ICM42688GND_Pin GPIO_PIN_3
+#define ICM42688GND_GPIO_Port GPIOE
+#define ICM42688VCC_Pin GPIO_PIN_4
+#define ICM42688VCC_GPIO_Port GPIOE
+#define DPS310VCC_Pin GPIO_PIN_2
+#define DPS310VCC_GPIO_Port GPIOA
+#define DPS310GND_Pin GPIO_PIN_3
+#define DPS310GND_GPIO_Port GPIOA
 #define DPS310_NCS_Pin GPIO_PIN_4
 #define DPS310_NCS_GPIO_Port GPIOA
 #define DPS310_Pin GPIO_PIN_5
@@ -71,25 +75,21 @@ void Error_Handler(void);
 #define PMW3901_NCS_GPIO_Port GPIOB
 #define PMW3901_Pin GPIO_PIN_13
 #define PMW3901_GPIO_Port GPIOB
-#define GND2_Pin GPIO_PIN_6
-#define GND2_GPIO_Port GPIOC
-#define VCC2_Pin GPIO_PIN_7
-#define VCC2_GPIO_Port GPIOC
+#define PMW3901VCC_Pin GPIO_PIN_14
+#define PMW3901VCC_GPIO_Port GPIOD
 #define ICM42688INT_Pin GPIO_PIN_8
 #define ICM42688INT_GPIO_Port GPIOC
 #define ICM42688INT_EXTI_IRQn EXTI9_5_IRQn
-#define GND3_Pin GPIO_PIN_9
-#define GND3_GPIO_Port GPIOA
-#define VCC3_Pin GPIO_PIN_10
-#define VCC3_GPIO_Port GPIOA
-#define VCC1_Pin GPIO_PIN_11
-#define VCC1_GPIO_Port GPIOA
-#define GND1_Pin GPIO_PIN_12
-#define GND1_GPIO_Port GPIOA
+#define PMW3901GND_Pin GPIO_PIN_15
+#define PMW3901GND_GPIO_Port GPIOA
 #define ICM42688_Pin GPIO_PIN_10
 #define ICM42688_GPIO_Port GPIOC
 #define ICM42688_NCS_Pin GPIO_PIN_2
 #define ICM42688_NCS_GPIO_Port GPIOD
+#define MMC5983VCC_Pin GPIO_PIN_4
+#define MMC5983VCC_GPIO_Port GPIOB
+#define MMC5983GND_Pin GPIO_PIN_5
+#define MMC5983GND_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
