@@ -32,6 +32,11 @@ static void DebugMonitor_Task(void* argument) {
         DebugMonitor_UpdateSensor(&g_DebugMonitor.pmw3901);
         DebugMonitor_UpdateSensor(&g_DebugMonitor.dps310);
         DebugMonitor_UpdateSensor(&g_DebugMonitor.mmc5983);
+
+
+        uint32_t curAttUpdates = g_DebugMonitor.attitude.updateCount;
+        g_DebugMonitor.attitude.updatesPerSecondHz = curAttUpdates - g_DebugMonitor.attitude._lastUpdateCount;
+        g_DebugMonitor.attitude._lastUpdateCount = curAttUpdates;
         
         // 2. 更新任务栈与 CPU 指标
         static TaskStatus_t taskStatusArray[15]; // 使用静态分配避免 pvPortMalloc 碎片化
@@ -116,6 +121,14 @@ void DebugMonitor_RecordError(SensorID_e id) {
         case SENSOR_ID_DPS310:   g_DebugMonitor.dps310.errors++;   break;
         case SENSOR_ID_MMC5983:  g_DebugMonitor.mmc5983.errors++;  break;
         default: break;
+    }
+}
+
+void DebugMonitor_RecordAttitudeUpdate(const VehicleState_t* state) {
+    g_DebugMonitor.attitude.updateCount++;
+    if (state != nullptr) {
+        // 利用结构体赋值特性，瞬间拷贝数据供调试器抓取（耗时基本为0，无需加锁）
+        g_DebugMonitor.attitude.latestState = *state;
     }
 }
 

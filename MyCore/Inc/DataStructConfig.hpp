@@ -42,6 +42,18 @@ typedef struct {
         } MMC5983;
     } data;
 } Sensor_Packet_t;
+// --- 补充在 MyCore/Inc/DataStructConfig.hpp 尾部 ---
+
+// 飞控 15维 ESKF 解算输出状态 (供后续 PID 姿态与位置控制器使用)
+typedef struct {
+    uint64_t timestamp;
+    float roll, pitch, yaw; // 欧拉角 (rad 弧度)
+    float q[4];             // 四元数: w, x, y, z
+    float position[3];      // NED位置 (m): 北、东、下 (注意：向下为正)
+    float velocity[3];      // NED速度 (m/s): 北、东、下
+    float accel_bias[3];    // 实时收敛的加速度计零偏 (m/s^2)
+    float gyro_bias[3];     // 实时收敛的陀螺仪零偏 (rad/s)
+} VehicleState_t;
 
 struct DeviceConfig {
     union {

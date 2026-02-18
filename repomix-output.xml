@@ -56,6 +56,7 @@ Core/Inc/main.h
 Core/Inc/spi.h
 Core/Inc/stm32h7xx_hal_conf.h
 Core/Inc/stm32h7xx_it.h
+Core/Inc/tim.h
 Core/Src/dma.c
 Core/Src/freertos.c
 Core/Src/gpio.c
@@ -68,7 +69,9 @@ Core/Src/stm32h7xx_it.c
 Core/Src/syscalls.c
 Core/Src/sysmem.c
 Core/Src/system_stm32h7xx.c
+Core/Src/tim.c
 Core/Startup/startup_stm32h743vitx.s
+MyCore/Inc/AttitudeESKF.hpp
 MyCore/Inc/DataStructConfig.hpp
 MyCore/Inc/DebugMonitor.hpp
 MyCore/Inc/DTCMinit.h
@@ -76,6 +79,7 @@ MyCore/Inc/Mydelay.hpp
 MyCore/Inc/QueueConfig.hpp
 MyCore/Inc/Sensors.hpp
 MyCore/Inc/TaskConfig.hpp
+MyCore/Src/AttitudeESKF.cpp
 MyCore/Src/Callback.cpp
 MyCore/Src/DataStructConfig.cpp
 MyCore/Src/DebugMonitor.cpp
@@ -92,6 +96,540 @@ STM32H743VITX_RAM.ld
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="MyCore/Inc/AttitudeESKF.hpp">
+#pragma once
+#include "main.h"
+#include "DataStructConfig.hpp"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// FreeRTOS 任务入口暴露给 C 环境
+void AttitudeEstimator_Init(void);
+
+#ifdef __cplusplus
+}
+
+class ESKF {
+public:
+    ESKF();
+    void Init(float initial_yaw, float initial_alt);
+    
+    // 核心卡尔曼循环
+    void PredictIMU(const float acc[3], const float gyro[3], float dt);
+    void UpdateBaro(float alt);
+    void UpdateMag(const float mag[3]);
+    void UpdateFlow(float flow_dx, float flow_dy, float dt);
+    void UpdateAccel(const float acc[3]);
+    void UpdateZUPT(void);
+    VehicleState_t GetState(uint64_t timestamp);
+
+    float base_baro;
+    bool is_inited;
+    
+private:
+    float p[3];      // 名义位置 NED
+    float v[3];      // 名义速度 NED
+    float q[4];      // 名义四元数
+    float bg[3];     // 陀螺仪零偏
+    float ba[3];     // 加速度零偏
+    float P[15][15]; // 误差状态协方差矩阵
+    
+    float last_gyro[3]; 
+
+    void GetRotationMatrix(float Rmat[3][3]);
+    void ScalarUpdate(const float H[15], float y, float R_var);
+    void InjectError(const float dx[15]);
+    
+};
+#endif
+</file>
+
+<file path="MyCore/Src/AttitudeESKF.cpp">
+#include "AttitudeESKF.hpp"
+#include "QueueConfig.hpp"
+#include "FreeRTOS.h"
+#include "task.h"
+#include <math.h>
+#include <string.h>
+#include "DebugMonitor.hpp"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+// 放入 DTCM 极速内存，避免占用 FreeRTOS 任务栈
+DTCM_DATA ESKF eskf;
+DTCM_DATA static StackType_t ESKFTaskStack[1024];
+DTCM_DATA static StaticTask_t ESKFTaskTCB;
+TaskHandle_t ESKFTaskHandle = NULL;
+
+ESKF::ESKF()
+{
+    is_inited = false;
+    base_baro = 101325.0f;
+}
+
+void ESKF::Init(float initial_yaw, float initial_alt)
+{
+    memset(p, 0, sizeof(p));
+    memset(v, 0, sizeof(v));
+    memset(bg, 0, sizeof(bg));
+    memset(ba, 0, sizeof(ba));
+
+    p[2] = -initial_alt; // NED坐标系，Z向下为正
+
+    q[0] = cosf(initial_yaw * 0.5f);
+    q[1] = 0.0f;
+    q[2] = 0.0f;
+    q[3] = sinf(initial_yaw * 0.5f);
+
+    memset(P, 0, sizeof(P));
+    for (int i = 0; i < 15; i++) {
+        if (i < 9)
+            P[i][i] = 1e-2f; // 位置、速度、姿态初始方差
+        else
+            P[i][i] = 1e-4f; // 零偏初始方差较小
+    }
+    is_inited = true;
+}
+
+void ESKF::GetRotationMatrix(float R[3][3])
+{
+    float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
+    R[0][0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+    R[0][1] = 2.0f * (qx * qy - qw * qz);
+    R[0][2] = 2.0f * (qx * qz + qw * qy);
+    R[1][0] = 2.0f * (qx * qy + qw * qz);
+    R[1][1] = 1.0f - 2.0f * (qx * qx + qz * qz);
+    R[1][2] = 2.0f * (qy * qz - qw * qx);
+    R[2][0] = 2.0f * (qx * qz - qw * qy);
+    R[2][1] = 2.0f * (qy * qz + qw * qx);
+    R[2][2] = 1.0f - 2.0f * (qx * qx + qy * qy);
+}
+
+void ESKF::PredictIMU(const float acc[3], const float gyro[3], float dt)
+{
+    // 1. 扣除零偏
+    float true_acc[3]  = {acc[0] - ba[0], acc[1] - ba[1], acc[2] - ba[2]};
+    float true_gyro[3] = {gyro[0] - bg[0], gyro[1] - bg[1], gyro[2] - bg[2]};
+
+    last_gyro[0] = true_gyro[0];
+    last_gyro[1] = true_gyro[1];
+    last_gyro[2] = true_gyro[2];
+
+    float Rmat[3][3];
+    GetRotationMatrix(Rmat);
+
+    // 2. 名义运动学积分
+    float a_ned[3] = {
+        Rmat[0][0] * true_acc[0] + Rmat[0][1] * true_acc[1] + Rmat[0][2] * true_acc[2],
+        Rmat[1][0] * true_acc[0] + Rmat[1][1] * true_acc[1] + Rmat[1][2] * true_acc[2],
+        Rmat[2][0] * true_acc[0] + Rmat[2][1] * true_acc[1] + Rmat[2][2] * true_acc[2] + 9.80665f // 重力补偿
+    };
+
+    for (int i = 0; i < 3; i++) {
+        p[i] += v[i] * dt + 0.5f * a_ned[i] * dt * dt;
+        v[i] += a_ned[i] * dt;
+    }
+
+    float theta = sqrtf(true_gyro[0] * true_gyro[0] + true_gyro[1] * true_gyro[1] + true_gyro[2] * true_gyro[2]) * dt;
+    float dq[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    if (theta > 1e-6f) {
+        float s = sinf(theta * 0.5f) / (theta / dt);
+        dq[0]   = cosf(theta * 0.5f);
+        dq[1]   = true_gyro[0] * s;
+        dq[2]   = true_gyro[1] * s;
+        dq[3]   = true_gyro[2] * s;
+    }
+
+    float q_new[4] = {
+        q[0] * dq[0] - q[1] * dq[1] - q[2] * dq[2] - q[3] * dq[3],
+        q[0] * dq[1] + q[1] * dq[0] + q[2] * dq[3] - q[3] * dq[2],
+        q[0] * dq[2] - q[1] * dq[3] + q[2] * dq[0] + q[3] * dq[1],
+        q[0] * dq[3] + q[1] * dq[2] - q[2] * dq[1] + q[3] * dq[0]};
+    float norm = sqrtf(q_new[0] * q_new[0] + q_new[1] * q_new[1] + q_new[2] * q_new[2] + q_new[3] * q_new[3]);
+    for (int i = 0; i < 4; i++) q[i] = q_new[i] / norm;
+
+    // 3. 构造状态转移雅可比矩阵 F (15x15)
+    float F[15][15] = {0};
+    for (int i = 0; i < 15; i++) F[i][i] = 1.0f;
+    for (int i = 0; i < 3; i++) F[i][i + 3] = dt;
+
+    float skew_a[3][3] = {{0, -true_acc[2], true_acc[1]}, {true_acc[2], 0, -true_acc[0]}, {-true_acc[1], true_acc[0], 0}};
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            F[3 + i][6 + j]  = -(Rmat[i][0] * skew_a[0][j] + Rmat[i][1] * skew_a[1][j] + Rmat[i][2] * skew_a[2][j]) * dt;
+            F[3 + i][12 + j] = -Rmat[i][j] * dt;
+        }
+    }
+    F[6][7]  = true_gyro[2] * dt;
+    F[6][8]  = -true_gyro[1] * dt;
+    F[7][6]  = -true_gyro[2] * dt;
+    F[7][8]  = true_gyro[0] * dt;
+    F[8][6]  = true_gyro[1] * dt;
+    F[8][7]  = -true_gyro[0] * dt;
+    F[6][9]  = -dt;
+    F[7][10] = -dt;
+    F[8][11] = -dt;
+
+    // 4. 协方差推演: P = F * P * F^T + Q (矩阵展开优化算法)
+    float FP[15][15] = {0};
+    for (int i = 0; i < 15; i++) {
+        for (int k = 0; k < 15; k++) {
+            if (F[i][k] != 0.0f) {
+                for (int j = 0; j < 15; j++) FP[i][j] += F[i][k] * P[k][j];
+            }
+        }
+    }
+    for (int i = 0; i < 15; i++) {
+        for (int j = 0; j < 15; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < 15; k++)
+                if (F[j][k] != 0.0f) sum += FP[i][k] * F[j][k];
+            P[i][j] = sum;
+        }
+    }
+
+    // 注入过程噪声 Q
+    for (int i = 3; i < 6; i++) P[i][i] += 1e-2f * dt;   // 速度游走
+    for (int i = 6; i < 9; i++) P[i][i] += 1e-4f * dt;   // 角度游走
+    for (int i = 9; i < 12; i++) P[i][i] += 1e-6f * dt;  // 陀螺零偏游走
+    for (int i = 12; i < 15; i++) P[i][i] += 1e-5f * dt; // 加速零偏游走
+}
+
+// =================== 极速降维：单向标量更新 ===================
+void ESKF::ScalarUpdate(const float H[15], float y, float R_var)
+{
+    float PHt[15] = {0};
+    float S       = R_var;
+    for (int i = 0; i < 15; i++) {
+        for (int j = 0; j < 15; j++)
+            if (H[j] != 0.0f) PHt[i] += P[i][j] * H[j];
+        S += H[i] * PHt[i];
+    }
+    if (S < 1e-6f) return;
+
+    float K[15], dx[15];
+    for (int i = 0; i < 15; i++) {
+        K[i]  = PHt[i] / S;
+        dx[i] = K[i] * y;
+    }
+
+    InjectError(dx);
+
+    for (int i = 0; i < 15; i++) {
+        for (int j = 0; j < 15; j++) P[i][j] -= K[i] * PHt[j];
+    }
+    for (int i = 0; i < 15; i++) { // 强制对称
+        for (int j = i + 1; j < 15; j++) {
+            float sym = 0.5f * (P[i][j] + P[j][i]);
+            P[i][j] = P[j][i] = sym;
+        }
+    }
+}
+
+void ESKF::InjectError(const float dx[15])
+{
+    for (int i = 0; i < 3; i++) {
+        p[i] += dx[i];
+        v[i] += dx[i + 3];
+        bg[i] += dx[i + 9];
+        ba[i] += dx[i + 12];
+    }
+    float dq[4]    = {1.0f, 0.5f * dx[6], 0.5f * dx[7], 0.5f * dx[8]};
+    float q_new[4] = {
+        q[0] * dq[0] - q[1] * dq[1] - q[2] * dq[2] - q[3] * dq[3],
+        q[0] * dq[1] + q[1] * dq[0] + q[2] * dq[3] - q[3] * dq[2],
+        q[0] * dq[2] - q[1] * dq[3] + q[2] * dq[0] + q[3] * dq[1],
+        q[0] * dq[3] + q[1] * dq[2] - q[2] * dq[1] + q[3] * dq[0]};
+    float norm = sqrtf(q_new[0] * q_new[0] + q_new[1] * q_new[1] + q_new[2] * q_new[2] + q_new[3] * q_new[3]);
+    for (int i = 0; i < 4; i++) q[i] = q_new[i] / norm;
+}
+
+// ---------------------- 观测接口 ----------------------
+void ESKF::UpdateBaro(float alt)
+{
+    float H[15] = {0};
+    H[2]        = -1.0f;                  // p[2] 是 NED 的 D (向下)，因此预测 alt 是 -p[2]
+    ScalarUpdate(H, alt - (-p[2]), 0.5f); // 气压计方差 R=0.5
+}
+
+void ESKF::UpdateMag(const float mag[3])
+{
+    float Rmat[3][3];
+    GetRotationMatrix(Rmat);
+    float roll  = atan2f(Rmat[2][1], Rmat[2][2]);
+    float pitch = asinf(-Rmat[2][0]);
+    float yaw   = atan2f(Rmat[1][0], Rmat[0][0]);
+
+    // 倾角补偿求绝对磁航向
+    float cr = cosf(roll), sr = sinf(roll), cp = cosf(pitch), sp = sinf(pitch);
+    float Xh       = mag[0] * cp + mag[1] * sr * sp + mag[2] * cr * sp;
+    float Yh       = mag[1] * cr - mag[2] * sr;
+    float meas_yaw = atan2f(-Yh, Xh);
+
+    float y = meas_yaw - yaw;
+    while (y > M_PI) y -= 2.0f * M_PI;
+    while (y < -M_PI) y += 2.0f * M_PI;
+
+    float H[15] = {0};
+    H[6]        = Rmat[2][0];
+    H[7]        = Rmat[2][1];
+    H[8]        = Rmat[2][2];
+    ScalarUpdate(H, y, 0.2f); // 磁力计方差 R=0.2
+}
+
+void ESKF::UpdateFlow(float dx, float dy, float dt)
+{
+    float z = -p[2]; // 对地高度
+    if (z < 0.1f) z = 0.1f;
+
+    // ★ 核心缩放系数: 像素与光流视场角换算率，需根据 PMW3901 镜头实测修改
+    float OPT_FLOW_SCALER = 30.0f;
+    float flow_wx         = (dx / dt) / OPT_FLOW_SCALER;
+    float flow_wy         = (dy / dt) / OPT_FLOW_SCALER;
+
+    // 抵消机身自转产生的虚假相对位移
+    float vbx_obs = (flow_wy - last_gyro[1]) * z;
+    float vby_obs = (flow_wx + last_gyro[0]) * z;
+
+    float Rmat[3][3];
+    GetRotationMatrix(Rmat);
+    float vbx_pred = Rmat[0][0] * v[0] + Rmat[1][0] * v[1] + Rmat[2][0] * v[2];
+    float vby_pred = Rmat[0][1] * v[0] + Rmat[1][1] * v[1] + Rmat[2][1] * v[2];
+    float vbz_pred = Rmat[0][2] * v[0] + Rmat[1][2] * v[1] + Rmat[2][2] * v[2];
+
+    // 分别进行 X 和 Y 轴的标量融合
+    float Hx[15] = {0};
+    Hx[3]        = Rmat[0][0];
+    Hx[4]        = Rmat[1][0];
+    Hx[5]        = Rmat[2][0];
+    Hx[7]        = -vbz_pred;
+    Hx[8]        = vby_pred;
+    ScalarUpdate(Hx, vbx_obs - vbx_pred, 0.1f);
+
+    float Hy[15] = {0};
+    Hy[3]        = Rmat[0][1];
+    Hy[4]        = Rmat[1][1];
+    Hy[5]        = Rmat[2][1];
+    Hy[6]        = vbz_pred;
+    Hy[8]        = -vbx_pred;
+    ScalarUpdate(Hy, vby_obs - vby_pred, 0.1f);
+}
+
+VehicleState_t ESKF::GetState(uint64_t timestamp)
+{
+    VehicleState_t s;
+    s.timestamp = timestamp;
+    float Rmat[3][3];
+    GetRotationMatrix(Rmat);
+    s.roll     = atan2f(Rmat[2][1], Rmat[2][2]);
+    float sinp = -Rmat[2][0];
+    if (sinp > 1.0f)
+        sinp = 1.0f;
+    else if (sinp < -1.0f)
+        sinp = -1.0f;
+    s.pitch = asinf(sinp);
+    s.yaw   = atan2f(Rmat[1][0], Rmat[0][0]);
+
+    for (int i = 0; i < 4; i++) s.q[i] = q[i];
+    for (int i = 0; i < 3; i++) {
+        s.position[i]   = p[i];
+        s.velocity[i]   = v[i];
+        s.accel_bias[i] = ba[i];
+        s.gyro_bias[i]  = bg[i];
+    }
+    return s;
+}
+
+// ================= FreeRTOS 任务主干 =================
+void AttitudeESKF_TaskEntry(void *argument)
+{
+    Sensor_Packet_t pkt;
+
+    // --- 阶段1：静止开机校准，获取初始基准 ---
+    int imu_cnt = 0, mag_cnt = 0, baro_cnt = 0;
+    float sum_acc[3] = {0}, sum_mag[3] = {0}, sum_baro = 0;
+
+    while (imu_cnt < 200) { // 等待约 0.2 秒收集基础环境数据
+        if (xQueueReceive(SensorsDataHub, &pkt, portMAX_DELAY)) {
+            if (pkt.tag == SENSOR_ID_ICM42688) {
+                sum_acc[0] += pkt.data.ICM42688.acc[0];
+                sum_acc[1] += pkt.data.ICM42688.acc[1];
+                sum_acc[2] += pkt.data.ICM42688.acc[2];
+                imu_cnt++;
+            } else if (pkt.tag == SENSOR_ID_MMC5983) {
+                sum_mag[0] += pkt.data.MMC5983.mag[0];
+                sum_mag[1] += pkt.data.MMC5983.mag[1];
+                sum_mag[2] += pkt.data.MMC5983.mag[2];
+                mag_cnt++;
+            } else if (pkt.tag == SENSOR_ID_DPS310) {
+                sum_baro += pkt.data.DPS310.pressure;
+                baro_cnt++;
+            }
+        }
+    }
+
+    float ax = sum_acc[0] / imu_cnt;
+    if (ax > 1.0f)
+        ax = 1.0f;
+    else if (ax < -1.0f)
+        ax = -1.0f;
+    float pitch = asinf(ax);
+    float roll  = atan2f(-(sum_acc[1] / imu_cnt), -(sum_acc[2] / imu_cnt));
+
+    float initial_yaw = 0.0f;
+    if (mag_cnt > 0) {
+        float Xh    = (sum_mag[0] / mag_cnt) * cosf(pitch) + (sum_mag[1] / mag_cnt) * sinf(roll) * sinf(pitch) + (sum_mag[2] / mag_cnt) * cosf(roll) * sinf(pitch);
+        float Yh    = (sum_mag[1] / mag_cnt) * cosf(roll) - (sum_mag[2] / mag_cnt) * sinf(roll);
+        initial_yaw = atan2f(-Yh, Xh);
+    }
+    if (baro_cnt > 0) eskf.base_baro = sum_baro / baro_cnt;
+
+    eskf.Init(initial_yaw, 0.0f);
+    uint64_t last_imu_ts = 0, last_flow_ts = 0;
+
+    // --- 阶段2：高速解算循环 ---
+    while (1) {
+        if (xQueueReceive(SensorsDataHub, &pkt, portMAX_DELAY)) {
+            switch (pkt.tag) {
+                case SENSOR_ID_ICM42688: { // IMU到达：触发预测并向外发布
+                    if (last_imu_ts != 0) {
+                        float dt = (pkt.timestamp - last_imu_ts) * 1e-9f;
+
+                        float acc[3]  = {pkt.data.ICM42688.acc[0] * 9.80665f, pkt.data.ICM42688.acc[1] * 9.80665f, pkt.data.ICM42688.acc[2] * 9.80665f};
+                        float gyro[3] = {pkt.data.ICM42688.gyro[0] * 0.01745329f, pkt.data.ICM42688.gyro[1] * 0.01745329f, pkt.data.ICM42688.gyro[2] * 0.01745329f};
+
+                        // 1. 运动学预测 (状态推演)
+                        eskf.PredictIMU(acc, gyro, dt);
+
+                        // ★ 2. 加速度计姿态更新 (非常关键：锁定水平面，防止重力泄露)
+                        eskf.UpdateAccel(acc);
+
+                        // ★ 3. 桌面静态抗漂移 ZUPT (Zero Velocity Update) 逻辑
+                        static int static_counter = 0;
+                        float gyro_norm           = sqrtf(gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2]);
+                        float acc_norm            = sqrtf(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+
+                        // 如果角速度极小 (<0.03 rad/s，约 1.7度/秒) 且加速度接近 1G，认为飞控板静止放在桌面上
+                        if (gyro_norm < 0.03f && fabsf(acc_norm - 9.80665f) < 0.5f) {
+                            static_counter++;
+                            if (static_counter > 50) { // 连续约50ms静止，认定为完全静置
+                                eskf.UpdateZUPT();
+                            }
+                        } else {
+                            static_counter = 0; // 一旦有拿起来或晃动，立即解除静止锁定
+                        }
+
+                        // 打包当前解算结果并用 Overwrite 机制发布给控制器
+                        VehicleState_t vs = eskf.GetState(pkt.timestamp);
+                        if (VehicleStateQueue != NULL) xQueueOverwrite(VehicleStateQueue, &vs);
+
+                        // 更新调试探针
+                        DBG_MON_ATTITUDE_UPDATE(&vs);
+                    }
+                    last_imu_ts = pkt.timestamp;
+                    break;
+                }
+                case SENSOR_ID_DPS310: { // 气压计到达：触发高度观测
+                    float alt = 44330.0f * (1.0f - powf(pkt.data.DPS310.pressure / eskf.base_baro, 0.190295f));
+                    eskf.UpdateBaro(alt);
+                    break;
+                }
+                case SENSOR_ID_MMC5983: { // 磁力计到达：触发航向观测
+                    eskf.UpdateMag(pkt.data.MMC5983.mag);
+                    break;
+                }
+                case SENSOR_ID_PMW3901: { // 光流到达：触发XY速度观测
+                    if (last_flow_ts != 0 && pkt.data.PMW3901.squal >= 20.0f) {
+                        float dt = (pkt.timestamp - last_flow_ts) * 1e-9f;
+                        if (dt > 0.0f && dt < 0.1f) {
+                            eskf.UpdateFlow(pkt.data.PMW3901.delta_x, pkt.data.PMW3901.delta_y, dt);
+                        }
+                    }
+                    last_flow_ts = pkt.timestamp;
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+}
+void ESKF::UpdateAccel(const float acc[3])
+{
+    // 1. 扣除零偏求当前真实加速度的模长 (m/s^2)
+    float true_acc[3] = {acc[0] - ba[0], acc[1] - ba[1], acc[2] - ba[2]};
+    float norm        = sqrtf(true_acc[0] * true_acc[0] + true_acc[1] * true_acc[1] + true_acc[2] * true_acc[2]);
+
+    // 2. 只有在无剧烈机动时才使用加速度计修正姿态 (约 0.8G ~ 1.2G)
+    // 避免机动时的异常加速度干扰重力方向
+    if (norm < 8.0f || norm > 11.5f) return;
+
+    // 3. 归一化测量向量 (机体坐标系下的重力支持力方向向量)
+    float v_meas[3] = {true_acc[0] / norm, true_acc[1] / norm, true_acc[2] / norm};
+
+    // 4. 计算期望的归一化重力向量
+    // (NED坐标系下重力向下为 [0, 0, 1]，转换到机体坐标系即为旋转矩阵的第三列转置。
+    // 由于加速度计测到的是向上的支持力，方向与重力相反，所以取负)
+    float Rmat[3][3];
+    GetRotationMatrix(Rmat);
+    float v_pred[3] = {-Rmat[0][2], -Rmat[1][2], -Rmat[2][2]};
+
+    // 5. 分别对 X、Y、Z 三个轴进行雅可比标量降维更新
+    float H[15] = {0};
+
+    // X轴倾角更新
+    H[6] = 0.0f;
+    H[7] = v_pred[2];
+    H[8] = -v_pred[1];
+    ScalarUpdate(H, v_meas[0] - v_pred[0], 0.05f); // 0.05f 为观测方差
+
+    // Y轴倾角更新
+    memset(H, 0, sizeof(H));
+    H[6] = -v_pred[2];
+    H[7] = 0.0f;
+    H[8] = v_pred[0];
+    ScalarUpdate(H, v_meas[1] - v_pred[1], 0.05f);
+
+    // Z轴倾角更新
+    memset(H, 0, sizeof(H));
+    H[6] = v_pred[1];
+    H[7] = -v_pred[0];
+    H[8] = 0.0f;
+    ScalarUpdate(H, v_meas[2] - v_pred[2], 0.05f);
+}
+
+void ESKF::UpdateZUPT(void)
+{
+    float H[15] = {0};
+
+    // 强制更新 X 轴速度为 0
+    H[3] = 1.0f;
+    ScalarUpdate(H, 0.0f - v[0], 0.005f); // 极小方差，强制收敛
+
+    // 强制更新 Y 轴速度为 0
+    memset(H, 0, sizeof(H));
+    H[4] = 1.0f;
+    ScalarUpdate(H, 0.0f - v[1], 0.005f);
+
+    // 强制更新 Z 轴速度为 0
+    memset(H, 0, sizeof(H));
+    H[5] = 1.0f;
+    ScalarUpdate(H, 0.0f - v[2], 0.005f);
+}
+
+void AttitudeEstimator_Init(void)
+{
+    ESKFTaskHandle = xTaskCreateStatic(
+        AttitudeESKF_TaskEntry, "AttEst", 1024, NULL,
+        configMAX_PRIORITIES - 3, // 优先级建议低于 Sensor 解析任务，高于未来其它控制逻辑
+        ESKFTaskStack, &ESKFTaskTCB);
+}
+</file>
 
 <file path=".clang-format">
 # For more options, open this url: https://clang.llvm.net.cn/docs/ClangFormatStyleOptions.html
@@ -364,44 +902,6 @@ options:
 # eide template
 *.ept
 *.eide-template
-</file>
-
-<file path=".mxproject">
-[PreviousLibFiles]
-LibFiles=Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_bus.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_crs.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_system.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_utils.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dmamux.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_mdma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_def.h;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy\stm32_hal_legacy.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi_ex.h;Middlewares\Third_Party\FreeRTOS\Source\include\croutine.h;Middlewares\Third_Party\FreeRTOS\Source\include\deprecated_definitions.h;Middlewares\Third_Party\FreeRTOS\Source\include\event_groups.h;Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h;Middlewares\Third_Party\FreeRTOS\Source\include\list.h;Middlewares\Third_Party\FreeRTOS\Source\include\message_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_prototypes.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_wrappers.h;Middlewares\Third_Party\FreeRTOS\Source\include\portable.h;Middlewares\Third_Party\FreeRTOS\Source\include\projdefs.h;Middlewares\Third_Party\FreeRTOS\Source\include\queue.h;Middlewares\Third_Party\FreeRTOS\Source\include\semphr.h;Middlewares\Third_Party\FreeRTOS\Source\include\stack_macros.h;Middlewares\Third_Party\FreeRTOS\Source\include\StackMacros.h;Middlewares\Third_Party\FreeRTOS\Source\include\stream_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\task.h;Middlewares\Third_Party\FreeRTOS\Source\include\timers.h;Middlewares\Third_Party\FreeRTOS\Source\include\atomic.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_mpool.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_os2.h;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\portmacro.h;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_bus.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_crs.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_system.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_utils.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dmamux.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_mdma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_def.h;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy\stm32_hal_legacy.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi_ex.h;Middlewares\Third_Party\FreeRTOS\Source\include\croutine.h;Middlewares\Third_Party\FreeRTOS\Source\include\deprecated_definitions.h;Middlewares\Third_Party\FreeRTOS\Source\include\event_groups.h;Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h;Middlewares\Third_Party\FreeRTOS\Source\include\list.h;Middlewares\Third_Party\FreeRTOS\Source\include\message_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_prototypes.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_wrappers.h;Middlewares\Third_Party\FreeRTOS\Source\include\portable.h;Middlewares\Third_Party\FreeRTOS\Source\include\projdefs.h;Middlewares\Third_Party\FreeRTOS\Source\include\queue.h;Middlewares\Third_Party\FreeRTOS\Source\include\semphr.h;Middlewares\Third_Party\FreeRTOS\Source\include\stack_macros.h;Middlewares\Third_Party\FreeRTOS\Source\include\StackMacros.h;Middlewares\Third_Party\FreeRTOS\Source\include\stream_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\task.h;Middlewares\Third_Party\FreeRTOS\Source\include\timers.h;Middlewares\Third_Party\FreeRTOS\Source\include\atomic.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_mpool.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_os2.h;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\portmacro.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\stm32h743xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\system_stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\system_stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Drivers\CMSIS\Include\cmsis_armcc.h;Drivers\CMSIS\Include\cmsis_armclang.h;Drivers\CMSIS\Include\cmsis_armclang_ltm.h;Drivers\CMSIS\Include\cmsis_compiler.h;Drivers\CMSIS\Include\cmsis_gcc.h;Drivers\CMSIS\Include\cmsis_iccarm.h;Drivers\CMSIS\Include\cmsis_version.h;Drivers\CMSIS\Include\core_armv81mml.h;Drivers\CMSIS\Include\core_armv8mbl.h;Drivers\CMSIS\Include\core_armv8mml.h;Drivers\CMSIS\Include\core_cm0.h;Drivers\CMSIS\Include\core_cm0plus.h;Drivers\CMSIS\Include\core_cm1.h;Drivers\CMSIS\Include\core_cm23.h;Drivers\CMSIS\Include\core_cm3.h;Drivers\CMSIS\Include\core_cm33.h;Drivers\CMSIS\Include\core_cm35p.h;Drivers\CMSIS\Include\core_cm4.h;Drivers\CMSIS\Include\core_cm7.h;Drivers\CMSIS\Include\core_sc000.h;Drivers\CMSIS\Include\core_sc300.h;Drivers\CMSIS\Include\mpu_armv7.h;Drivers\CMSIS\Include\mpu_armv8.h;Drivers\CMSIS\Include\tz_context.h;
-
-[PreviousUsedCubeIDEFiles]
-SourceFiles=Core\Src\main.c;Core\Src\gpio.c;Core\Src\freertos.c;Core\Src\dma.c;Core\Src\i2c.c;Core\Src\spi.c;Core\Src\stm32h7xx_it.c;Core\Src\stm32h7xx_hal_msp.c;Core\Src\stm32h7xx_hal_timebase_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Core\Src\system_stm32h7xx.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Core\Src\system_stm32h7xx.c;;;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;
-HeaderPath=Drivers\STM32H7xx_HAL_Driver\Inc;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy;Middlewares\Third_Party\FreeRTOS\Source\include;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F;Drivers\CMSIS\Device\ST\STM32H7xx\Include;Drivers\CMSIS\Include;Core\Inc;
-CDefines=USE_PWR_LDO_SUPPLY;USE_PWR_LDO_SUPPLY;USE_HAL_DRIVER;STM32H743xx;USE_HAL_DRIVER;USE_HAL_DRIVER;
-
-[PreviousGenFiles]
-AdvancedFolderStructure=true
-HeaderFileListSize=8
-HeaderFiles#0=..\Core\Inc\gpio.h
-HeaderFiles#1=..\Core\Inc\FreeRTOSConfig.h
-HeaderFiles#2=..\Core\Inc\dma.h
-HeaderFiles#3=..\Core\Inc\i2c.h
-HeaderFiles#4=..\Core\Inc\spi.h
-HeaderFiles#5=..\Core\Inc\stm32h7xx_it.h
-HeaderFiles#6=..\Core\Inc\stm32h7xx_hal_conf.h
-HeaderFiles#7=..\Core\Inc\main.h
-HeaderFolderListSize=1
-HeaderPath#0=..\Core\Inc
-HeaderFiles=;
-SourceFileListSize=9
-SourceFiles#0=..\Core\Src\gpio.c
-SourceFiles#1=..\Core\Src\freertos.c
-SourceFiles#2=..\Core\Src\dma.c
-SourceFiles#3=..\Core\Src\i2c.c
-SourceFiles#4=..\Core\Src\spi.c
-SourceFiles#5=..\Core\Src\stm32h7xx_it.c
-SourceFiles#6=..\Core\Src\stm32h7xx_hal_msp.c
-SourceFiles#7=..\Core\Src\stm32h7xx_hal_timebase_tim.c
-SourceFiles#8=..\Core\Src\main.c
-SourceFolderListSize=1
-SourcePath#0=..\Core\Src
-SourceFiles=;
 </file>
 
 <file path=".project">
@@ -844,6 +1344,8 @@ extern SPI_HandleTypeDef hspi2;
 
 extern SPI_HandleTypeDef hspi3;
 
+extern SPI_HandleTypeDef hspi4;
+
 /* USER CODE BEGIN Private defines */
 
 /* USER CODE END Private defines */
@@ -851,6 +1353,7 @@ extern SPI_HandleTypeDef hspi3;
 void MX_SPI1_Init(void);
 void MX_SPI2_Init(void);
 void MX_SPI3_Init(void);
+void MX_SPI4_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
@@ -1380,6 +1883,65 @@ void MX_SPI3_Init(void);
 #endif /* STM32H7xx_HAL_CONF_H */
 </file>
 
+<file path="Core/Inc/tim.h">
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    tim.h
+  * @brief   This file contains all the function prototypes for
+  *          the tim.c file
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Define to prevent recursive inclusion -------------------------------------*/
+#ifndef __TIM_H__
+#define __TIM_H__
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+extern TIM_HandleTypeDef htim2;
+
+extern TIM_HandleTypeDef htim4;
+
+/* USER CODE BEGIN Private defines */
+
+/* USER CODE END Private defines */
+
+void MX_TIM2_Init(void);
+void MX_TIM4_Init(void);
+
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
+/* USER CODE BEGIN Prototypes */
+
+/* USER CODE END Prototypes */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __TIM_H__ */
+</file>
+
 <file path="Core/Src/dma.c">
 /* USER CODE BEGIN Header */
 /**
@@ -1424,6 +1986,7 @@ void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
@@ -1450,6 +2013,12 @@ void MX_DMA_Init(void)
   /* DMA1_Stream7_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream7_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream7_IRQn);
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+  /* DMA2_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
 
 }
 
@@ -2639,6 +3208,241 @@ void ExitRun0Mode(void)
   */
 </file>
 
+<file path="Core/Src/tim.c">
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    tim.c
+  * @brief   This file provides code for the configuration
+  *          of the TIM instances.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "tim.h"
+
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim4;
+
+/* TIM2 init function */
+void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 240-1;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 20000;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
+
+}
+/* TIM4 init function */
+void MX_TIM4_Init(void)
+{
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 240-1;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 20000;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 1500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM4_Init 2 */
+
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
+
+}
+
+void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* tim_pwmHandle)
+{
+
+  if(tim_pwmHandle->Instance==TIM2)
+  {
+  /* USER CODE BEGIN TIM2_MspInit 0 */
+
+  /* USER CODE END TIM2_MspInit 0 */
+    /* TIM2 clock enable */
+    __HAL_RCC_TIM2_CLK_ENABLE();
+  /* USER CODE BEGIN TIM2_MspInit 1 */
+
+  /* USER CODE END TIM2_MspInit 1 */
+  }
+  else if(tim_pwmHandle->Instance==TIM4)
+  {
+  /* USER CODE BEGIN TIM4_MspInit 0 */
+
+  /* USER CODE END TIM4_MspInit 0 */
+    /* TIM4 clock enable */
+    __HAL_RCC_TIM4_CLK_ENABLE();
+  /* USER CODE BEGIN TIM4_MspInit 1 */
+
+  /* USER CODE END TIM4_MspInit 1 */
+  }
+}
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
+{
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  if(timHandle->Instance==TIM2)
+  {
+  /* USER CODE BEGIN TIM2_MspPostInit 0 */
+
+  /* USER CODE END TIM2_MspPostInit 0 */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**TIM2 GPIO Configuration
+    PA0     ------> TIM2_CH1
+    PA1     ------> TIM2_CH2
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN TIM2_MspPostInit 1 */
+
+  /* USER CODE END TIM2_MspPostInit 1 */
+  }
+  else if(timHandle->Instance==TIM4)
+  {
+  /* USER CODE BEGIN TIM4_MspPostInit 0 */
+
+  /* USER CODE END TIM4_MspPostInit 0 */
+
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    /**TIM4 GPIO Configuration
+    PD12     ------> TIM4_CH1
+    PD13     ------> TIM4_CH2
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_12|GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF2_TIM4;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN TIM4_MspPostInit 1 */
+
+  /* USER CODE END TIM4_MspPostInit 1 */
+  }
+
+}
+
+void HAL_TIM_PWM_MspDeInit(TIM_HandleTypeDef* tim_pwmHandle)
+{
+
+  if(tim_pwmHandle->Instance==TIM2)
+  {
+  /* USER CODE BEGIN TIM2_MspDeInit 0 */
+
+  /* USER CODE END TIM2_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_TIM2_CLK_DISABLE();
+  /* USER CODE BEGIN TIM2_MspDeInit 1 */
+
+  /* USER CODE END TIM2_MspDeInit 1 */
+  }
+  else if(tim_pwmHandle->Instance==TIM4)
+  {
+  /* USER CODE BEGIN TIM4_MspDeInit 0 */
+
+  /* USER CODE END TIM4_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_TIM4_CLK_DISABLE();
+  /* USER CODE BEGIN TIM4_MspDeInit 1 */
+
+  /* USER CODE END TIM4_MspDeInit 1 */
+  }
+}
+
+/* USER CODE BEGIN 1 */
+
+/* USER CODE END 1 */
+</file>
+
 <file path="Core/Startup/startup_stm32h743vitx.s">
 /**
   ******************************************************************************
@@ -3415,51 +4219,62 @@ struct TaskDebugInfo_t {
     uint32_t _lastRunTime;       // 内部变量
 };
 
+struct AttitudeDebugInfo_t {
+    uint32_t updateCount;        // 累计完成姿态解算的次数
+    uint32_t updatesPerSecondHz; // 当前解算频率 (Hz，理想情况下应等于 ICM42688 的读取频率)
+    VehicleState_t latestState;  // 最新解算的姿态与位置数据 (便于直接观察Roll/Pitch/Yaw)
+
+    uint32_t _lastUpdateCount; // 内部变量
+};
+
 // 传感器健康与状态信息结构体
 struct SensorDebugInfo_t {
-    uint32_t attempts;           // 尝试发起总线读取的总次数
-    uint32_t successes;          // 成功读取且数据解析有效的总次数
-    uint32_t errors;             // 总线传输失败或数据包无效的次数
-    uint32_t readsPerSecondHz;   // 当前真实的每秒成功读取次数 (即传感器有效运行频率 Hz)
-    float failureRatePercent;    // 累计读取异常失败率 (%)
-    Sensor_Packet_t latestData;  // 传感器最新数值 (在调试器直接展开看解析好的数值)
-    
-    uint32_t _lastSuccesses;     // 内部变量
+    uint32_t attempts;          // 尝试发起总线读取的总次数
+    uint32_t successes;         // 成功读取且数据解析有效的总次数
+    uint32_t errors;            // 总线传输失败或数据包无效的次数
+    uint32_t readsPerSecondHz;  // 当前真实的每秒成功读取次数 (即传感器有效运行频率 Hz)
+    float failureRatePercent;   // 累计读取异常失败率 (%)
+    Sensor_Packet_t latestData; // 传感器最新数值 (在调试器直接展开看解析好的数值)
+
+    uint32_t _lastSuccesses; // 内部变量
 };
 
 // 全局 LiveWatch 聚合观测结构体
 struct SystemDebugMonitor_t {
-    float totalCpuUsage;         // 系统当前整体业务 CPU 占用率
-    uint32_t uptimeSeconds;      // 飞控运行时长 (秒)
+    float totalCpuUsage;    // 系统当前整体业务 CPU 占用率
+    uint32_t uptimeSeconds; // 飞控运行时长 (秒)
     uint32_t taskCount;
-    
-    TaskDebugInfo_t tasks[15];   
-    
+
+    TaskDebugInfo_t tasks[15];
+
     SensorDebugInfo_t icm42688;
     SensorDebugInfo_t pmw3901;
     SensorDebugInfo_t dps310;
     SensorDebugInfo_t mmc5983;
+    AttitudeDebugInfo_t attitude;
 };
 
 extern SystemDebugMonitor_t g_DebugMonitor; // Live Watch 观测这个变量
 
 void DebugMonitor_Init();
 void DebugMonitor_RecordAttempt(SensorID_e id);
-void DebugMonitor_RecordSuccess(SensorID_e id, const Sensor_Packet_t* packet);
+void DebugMonitor_RecordSuccess(SensorID_e id, const Sensor_Packet_t *packet);
 void DebugMonitor_RecordError(SensorID_e id);
+void DebugMonitor_RecordAttitudeUpdate(const VehicleState_t *state);
 
 // 给业务逻辑插装的探针宏
-#define DBG_MON_INIT()                  DebugMonitor_Init()
-#define DBG_MON_ATTEMPT(id)             DebugMonitor_RecordAttempt(id)
-#define DBG_MON_SUCCESS(id, packet)     DebugMonitor_RecordSuccess(id, packet)
-#define DBG_MON_ERROR(id)               DebugMonitor_RecordError(id)
-
+#define DBG_MON_INIT()                 DebugMonitor_Init()
+#define DBG_MON_ATTEMPT(id)            DebugMonitor_RecordAttempt(id)
+#define DBG_MON_SUCCESS(id, packet)    DebugMonitor_RecordSuccess(id, packet)
+#define DBG_MON_ERROR(id)              DebugMonitor_RecordError(id)
+#define DBG_MON_ATTITUDE_UPDATE(state) DebugMonitor_RecordAttitudeUpdate(state)
 #else // 关闭调试监控，实现绝对的零消耗
 
-#define DBG_MON_INIT()                  ((void)0)
-#define DBG_MON_ATTEMPT(id)             ((void)0)
-#define DBG_MON_SUCCESS(id, packet)     ((void)0)
-#define DBG_MON_ERROR(id)               ((void)0)
+#define DBG_MON_INIT()                 ((void)0)
+#define DBG_MON_ATTEMPT(id)            ((void)0)
+#define DBG_MON_SUCCESS(id, packet)    ((void)0)
+#define DBG_MON_ERROR(id)              ((void)0)
+#define DBG_MON_ATTITUDE_UPDATE(state) ((void)0)
 
 #endif
 </file>
@@ -3472,36 +4287,13 @@ void System_DTCM_Init(void);
 #endif // !DTCMINIT_H
 </file>
 
-<file path="MyCore/Inc/Mydelay.hpp">
-#pragma once 
-#include "main.h"
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-// 初始化 DWT 计数器和保活机制
-void DWT_Time_Init(void);
-
-// 传统的微秒延时 (阻塞式)
-void delay_us(uint32_t us);
-
-// 🛑 【核心】获取 64位 纳秒级系统时间戳
-// 特性：线程安全、中断安全、584年不溢出
-uint64_t Get_System_Time_ns(void);
-
-#ifdef __cplusplus
-}
-#endif
-</file>
-
 <file path="MyCore/Inc/QueueConfig.hpp">
 #pragma once
 
 #include"FreeRTOS.h"
 #include"queue.h"
 extern QueueHandle_t SensorsDataHub;
-
+extern QueueHandle_t VehicleStateQueue;
 void SystemQueueInit(void);
 </file>
 
@@ -3540,6 +4332,11 @@ static void DebugMonitor_Task(void* argument) {
         DebugMonitor_UpdateSensor(&g_DebugMonitor.pmw3901);
         DebugMonitor_UpdateSensor(&g_DebugMonitor.dps310);
         DebugMonitor_UpdateSensor(&g_DebugMonitor.mmc5983);
+
+
+        uint32_t curAttUpdates = g_DebugMonitor.attitude.updateCount;
+        g_DebugMonitor.attitude.updatesPerSecondHz = curAttUpdates - g_DebugMonitor.attitude._lastUpdateCount;
+        g_DebugMonitor.attitude._lastUpdateCount = curAttUpdates;
         
         // 2. 更新任务栈与 CPU 指标
         static TaskStatus_t taskStatusArray[15]; // 使用静态分配避免 pvPortMalloc 碎片化
@@ -3627,6 +4424,14 @@ void DebugMonitor_RecordError(SensorID_e id) {
     }
 }
 
+void DebugMonitor_RecordAttitudeUpdate(const VehicleState_t* state) {
+    g_DebugMonitor.attitude.updateCount++;
+    if (state != nullptr) {
+        // 利用结构体赋值特性，瞬间拷贝数据供调试器抓取（耗时基本为0，无需加锁）
+        g_DebugMonitor.attitude.latestState = *state;
+    }
+}
+
 #endif
 </file>
 
@@ -3666,84 +4471,17 @@ void System_DTCM_Init(void)
 }
 </file>
 
-<file path="MyCore/Src/Mydelay.cpp">
-#include "Mydelay.hpp"
-#include "FreeRTOS.h"
-#include "task.h"
-#include "timers.h" // 引入软件定时器
-
-
-static volatile uint32_t s_last_cyccnt = 0;
-static volatile uint64_t s_total_cycles = 0;
-
-static void TimeBase_KeepAlive_Callback(TimerHandle_t xTimer) {
-    (void)xTimer;
-    Get_System_Time_ns(); // 仅仅调用一次，利用其内部机制更新 s_total_cycles
-}
-
-
-void DWT_Time_Init(void) {
-    // 1. 启用 DWT 硬件
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    
-    // 初始化静态变量
-    s_last_cyccnt = DWT->CYCCNT;
-    s_total_cycles = 0;
-
-    TimerHandle_t hTimer = xTimerCreate(
-        "TimeGuard",             // 名字
-        pdMS_TO_TICKS(4000),     // 周期 4秒 (远小于 8.9秒溢出时间)
-        pdTRUE,                  // 自动重载
-        (void*)0,                // ID
-        TimeBase_KeepAlive_Callback // 回调函数
-    );
-
-    if (hTimer != NULL) {
-        xTimerStart(hTimer, 0); // 启动定时器
-    }
-}
-
-void delay_us(uint32_t us) {
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * (SystemCoreClock / 1000000);
-    while ((DWT->CYCCNT - start) < ticks);
-}
-
-uint64_t Get_System_Time_ns(void) {
-
-    uint32_t isr_mask = portSET_INTERRUPT_MASK_FROM_ISR();
-
-    uint32_t current_cyccnt = DWT->CYCCNT;
-
-    uint32_t delta = current_cyccnt - s_last_cyccnt;
-    
-    s_total_cycles += delta;
-    s_last_cyccnt = current_cyccnt;
-
-    uint64_t cycles_copy = s_total_cycles;
-
-    portCLEAR_INTERRUPT_MASK_FROM_ISR(isr_mask);
-    
-    uint64_t seconds = cycles_copy / SystemCoreClock;         // 整数秒
-    uint64_t fraction = cycles_copy % SystemCoreClock;        // 不足一秒的周期数
-
-    uint64_t time_ns = (seconds * 1000000000ULL) + 
-                       ((fraction * 1000000000ULL) / SystemCoreClock);
-
-    return time_ns;
-}
-</file>
-
 <file path="MyCore/Src/QueueConfig.cpp">
-#include"QueueConfig.hpp"
-#include"DataStructConfig.hpp"
-#include"Sensors.hpp"
-QueueHandle_t SensorsDataHub=NULL;
+#include "QueueConfig.hpp"
+#include "DataStructConfig.hpp"
+#include "Sensors.hpp"
+QueueHandle_t SensorsDataHub = NULL;
+QueueHandle_t VehicleStateQueue=NULL;
+
 void SystemQueueInit(void)
 {
-    SensorsDataHub=xQueueCreate(20,sizeof(Sensor_Packet_t));
+    SensorsDataHub    = xQueueCreate(20, sizeof(Sensor_Packet_t));
+    VehicleStateQueue = xQueueCreate(1, sizeof(VehicleState_t));
 }
 </file>
 
@@ -4290,6 +5028,46 @@ targets:
     uploader: JLink
 </file>
 
+<file path=".mxproject">
+[PreviousLibFiles]
+LibFiles=Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_bus.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_crs.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_system.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_utils.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dmamux.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_mdma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_def.h;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy\stm32_hal_legacy.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_tim.h;Middlewares\Third_Party\FreeRTOS\Source\include\croutine.h;Middlewares\Third_Party\FreeRTOS\Source\include\deprecated_definitions.h;Middlewares\Third_Party\FreeRTOS\Source\include\event_groups.h;Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h;Middlewares\Third_Party\FreeRTOS\Source\include\list.h;Middlewares\Third_Party\FreeRTOS\Source\include\message_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_prototypes.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_wrappers.h;Middlewares\Third_Party\FreeRTOS\Source\include\portable.h;Middlewares\Third_Party\FreeRTOS\Source\include\projdefs.h;Middlewares\Third_Party\FreeRTOS\Source\include\queue.h;Middlewares\Third_Party\FreeRTOS\Source\include\semphr.h;Middlewares\Third_Party\FreeRTOS\Source\include\stack_macros.h;Middlewares\Third_Party\FreeRTOS\Source\include\StackMacros.h;Middlewares\Third_Party\FreeRTOS\Source\include\stream_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\task.h;Middlewares\Third_Party\FreeRTOS\Source\include\timers.h;Middlewares\Third_Party\FreeRTOS\Source\include\atomic.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_mpool.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_os2.h;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\portmacro.h;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_tim_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_cortex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_rcc_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_bus.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_rcc.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_crs.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_system.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_utils.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_flash_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_gpio_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_gpio.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_hsem.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_dma_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_dmamux.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_mdma.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_pwr_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_pwr.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_def.h;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy\stm32_hal_legacy.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_i2c_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_exti.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_i2c.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_spi.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_hal_spi_ex.h;Drivers\STM32H7xx_HAL_Driver\Inc\stm32h7xx_ll_tim.h;Middlewares\Third_Party\FreeRTOS\Source\include\croutine.h;Middlewares\Third_Party\FreeRTOS\Source\include\deprecated_definitions.h;Middlewares\Third_Party\FreeRTOS\Source\include\event_groups.h;Middlewares\Third_Party\FreeRTOS\Source\include\FreeRTOS.h;Middlewares\Third_Party\FreeRTOS\Source\include\list.h;Middlewares\Third_Party\FreeRTOS\Source\include\message_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_prototypes.h;Middlewares\Third_Party\FreeRTOS\Source\include\mpu_wrappers.h;Middlewares\Third_Party\FreeRTOS\Source\include\portable.h;Middlewares\Third_Party\FreeRTOS\Source\include\projdefs.h;Middlewares\Third_Party\FreeRTOS\Source\include\queue.h;Middlewares\Third_Party\FreeRTOS\Source\include\semphr.h;Middlewares\Third_Party\FreeRTOS\Source\include\stack_macros.h;Middlewares\Third_Party\FreeRTOS\Source\include\StackMacros.h;Middlewares\Third_Party\FreeRTOS\Source\include\stream_buffer.h;Middlewares\Third_Party\FreeRTOS\Source\include\task.h;Middlewares\Third_Party\FreeRTOS\Source\include\timers.h;Middlewares\Third_Party\FreeRTOS\Source\include\atomic.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_mpool.h;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\freertos_os2.h;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\portmacro.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\stm32h743xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\system_stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Include\system_stm32h7xx.h;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Drivers\CMSIS\Include\cmsis_armcc.h;Drivers\CMSIS\Include\cmsis_armclang.h;Drivers\CMSIS\Include\cmsis_armclang_ltm.h;Drivers\CMSIS\Include\cmsis_compiler.h;Drivers\CMSIS\Include\cmsis_gcc.h;Drivers\CMSIS\Include\cmsis_iccarm.h;Drivers\CMSIS\Include\cmsis_version.h;Drivers\CMSIS\Include\core_armv81mml.h;Drivers\CMSIS\Include\core_armv8mbl.h;Drivers\CMSIS\Include\core_armv8mml.h;Drivers\CMSIS\Include\core_cm0.h;Drivers\CMSIS\Include\core_cm0plus.h;Drivers\CMSIS\Include\core_cm1.h;Drivers\CMSIS\Include\core_cm23.h;Drivers\CMSIS\Include\core_cm3.h;Drivers\CMSIS\Include\core_cm33.h;Drivers\CMSIS\Include\core_cm35p.h;Drivers\CMSIS\Include\core_cm4.h;Drivers\CMSIS\Include\core_cm7.h;Drivers\CMSIS\Include\core_sc000.h;Drivers\CMSIS\Include\core_sc300.h;Drivers\CMSIS\Include\mpu_armv7.h;Drivers\CMSIS\Include\mpu_armv8.h;Drivers\CMSIS\Include\tz_context.h;
+
+[PreviousUsedCubeIDEFiles]
+SourceFiles=Core\Src\main.c;Core\Src\gpio.c;Core\Src\freertos.c;Core\Src\dma.c;Core\Src\i2c.c;Core\Src\spi.c;Core\Src\tim.c;Core\Src\stm32h7xx_it.c;Core\Src\stm32h7xx_hal_msp.c;Core\Src\stm32h7xx_hal_timebase_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Core\Src\system_stm32h7xx.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_tim_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_cortex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_rcc_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_flash_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_gpio.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_hsem.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_dma_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_mdma.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_pwr_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_i2c_ex.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_exti.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi.c;Drivers\STM32H7xx_HAL_Driver\Src\stm32h7xx_hal_spi_ex.c;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;Drivers\CMSIS\Device\ST\STM32H7xx\Source\Templates\system_stm32h7xx.c;Core\Src\system_stm32h7xx.c;;;Middlewares\Third_Party\FreeRTOS\Source\croutine.c;Middlewares\Third_Party\FreeRTOS\Source\event_groups.c;Middlewares\Third_Party\FreeRTOS\Source\list.c;Middlewares\Third_Party\FreeRTOS\Source\queue.c;Middlewares\Third_Party\FreeRTOS\Source\stream_buffer.c;Middlewares\Third_Party\FreeRTOS\Source\tasks.c;Middlewares\Third_Party\FreeRTOS\Source\timers.c;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2\cmsis_os2.c;Middlewares\Third_Party\FreeRTOS\Source\portable\MemMang\heap_4.c;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F\port.c;
+HeaderPath=Drivers\STM32H7xx_HAL_Driver\Inc;Drivers\STM32H7xx_HAL_Driver\Inc\Legacy;Middlewares\Third_Party\FreeRTOS\Source\include;Middlewares\Third_Party\FreeRTOS\Source\CMSIS_RTOS_V2;Middlewares\Third_Party\FreeRTOS\Source\portable\GCC\ARM_CM4F;Drivers\CMSIS\Device\ST\STM32H7xx\Include;Drivers\CMSIS\Include;Core\Inc;
+CDefines=USE_PWR_LDO_SUPPLY;USE_PWR_LDO_SUPPLY;USE_HAL_DRIVER;STM32H743xx;USE_HAL_DRIVER;USE_HAL_DRIVER;
+
+[PreviousGenFiles]
+AdvancedFolderStructure=true
+HeaderFileListSize=9
+HeaderFiles#0=..\Core\Inc\gpio.h
+HeaderFiles#1=..\Core\Inc\FreeRTOSConfig.h
+HeaderFiles#2=..\Core\Inc\dma.h
+HeaderFiles#3=..\Core\Inc\i2c.h
+HeaderFiles#4=..\Core\Inc\spi.h
+HeaderFiles#5=..\Core\Inc\tim.h
+HeaderFiles#6=..\Core\Inc\stm32h7xx_it.h
+HeaderFiles#7=..\Core\Inc\stm32h7xx_hal_conf.h
+HeaderFiles#8=..\Core\Inc\main.h
+HeaderFolderListSize=1
+HeaderPath#0=..\Core\Inc
+HeaderFiles=;
+SourceFileListSize=10
+SourceFiles#0=..\Core\Src\gpio.c
+SourceFiles#1=..\Core\Src\freertos.c
+SourceFiles#2=..\Core\Src\dma.c
+SourceFiles#3=..\Core\Src\i2c.c
+SourceFiles#4=..\Core\Src\spi.c
+SourceFiles#5=..\Core\Src\tim.c
+SourceFiles#6=..\Core\Src\stm32h7xx_it.c
+SourceFiles#7=..\Core\Src\stm32h7xx_hal_msp.c
+SourceFiles#8=..\Core\Src\stm32h7xx_hal_timebase_tim.c
+SourceFiles#9=..\Core\Src\main.c
+SourceFolderListSize=1
+SourcePath#0=..\Core\Src
+SourceFiles=;
+</file>
+
 <file path="Core/Inc/stm32h7xx_it.h">
 /* USER CODE BEGIN Header */
 /**
@@ -4360,6 +5138,9 @@ void SPI2_IRQHandler(void);
 void DMA1_Stream7_IRQHandler(void);
 void SPI3_IRQHandler(void);
 void TIM7_IRQHandler(void);
+void DMA2_Stream0_IRQHandler(void);
+void DMA2_Stream1_IRQHandler(void);
+void SPI4_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */
@@ -4369,330 +5150,6 @@ void TIM7_IRQHandler(void);
 #endif
 
 #endif /* __STM32H7xx_IT_H */
-</file>
-
-<file path="Core/Src/gpio.c">
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file    gpio.c
-  * @brief   This file provides code for the configuration
-  *          of all used GPIO pins.
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-
-/* Includes ------------------------------------------------------------------*/
-#include "gpio.h"
-
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-/*----------------------------------------------------------------------------*/
-/* Configure GPIO                                                             */
-/*----------------------------------------------------------------------------*/
-/* USER CODE BEGIN 1 */
-
-/* USER CODE END 1 */
-
-/** Configure pins
-     PH0-OSC_IN (PH0)   ------> RCC_OSC_IN
-     PH1-OSC_OUT (PH1)   ------> RCC_OSC_OUT
-     PA13 (JTMS/SWDIO)   ------> DEBUG_JTMS-SWDIO
-     PA14 (JTCK/SWCLK)   ------> DEBUG_JTCK-SWCLK
-*/
-void MX_GPIO_Init(void)
-{
-
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, VCC4_Pin|VCC2_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GND4_Pin|GND2_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, DPS310_NCS_Pin|VCC3_Pin|VCC1_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(PMW3901_NCS_GPIO_Port, PMW3901_NCS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GND3_Pin|GND1_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(ICM42688_NCS_GPIO_Port, ICM42688_NCS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pins : VCC4_Pin GND4_Pin GND2_Pin VCC2_Pin */
-  GPIO_InitStruct.Pin = VCC4_Pin|GND4_Pin|GND2_Pin|VCC2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : DPS310_NCS_Pin */
-  GPIO_InitStruct.Pin = DPS310_NCS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(DPS310_NCS_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PMW3901_NCS_Pin */
-  GPIO_InitStruct.Pin = PMW3901_NCS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(PMW3901_NCS_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : ICM42688INT_Pin */
-  GPIO_InitStruct.Pin = ICM42688INT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ICM42688INT_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : GND3_Pin VCC3_Pin VCC1_Pin GND1_Pin */
-  GPIO_InitStruct.Pin = GND3_Pin|VCC3_Pin|VCC1_Pin|GND1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : ICM42688_NCS_Pin */
-  GPIO_InitStruct.Pin = ICM42688_NCS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(ICM42688_NCS_GPIO_Port, &GPIO_InitStruct);
-
-  /*AnalogSwitch Config */
-  HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
-
-  /*AnalogSwitch Config */
-  HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC3, SYSCFG_SWITCH_PC3_CLOSE);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-}
-
-/* USER CODE BEGIN 2 */
-
-/* USER CODE END 2 */
-</file>
-
-<file path="Core/Src/i2c.c">
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file    i2c.c
-  * @brief   This file provides code for the configuration
-  *          of the I2C instances.
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "i2c.h"
-
-/* USER CODE BEGIN 0 */
-
-/* USER CODE END 0 */
-
-I2C_HandleTypeDef hi2c1;
-DMA_HandleTypeDef hdma_i2c1_rx;
-DMA_HandleTypeDef hdma_i2c1_tx;
-
-/* I2C1 init function */
-void MX_I2C1_Init(void)
-{
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x307075B1;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Analogue filter
-  */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Configure Digital filter
-  */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
-}
-
-void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
-{
-
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
-  if(i2cHandle->Instance==I2C1)
-  {
-  /* USER CODE BEGIN I2C1_MspInit 0 */
-
-  /* USER CODE END I2C1_MspInit 0 */
-
-  /** Initializes the peripherals clock
-  */
-    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
-    PeriphClkInitStruct.I2c123ClockSelection = RCC_I2C123CLKSOURCE_D2PCLK1;
-    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    /**I2C1 GPIO Configuration
-    PB8     ------> I2C1_SCL
-    PB9     ------> I2C1_SDA
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    /* I2C1 clock enable */
-    __HAL_RCC_I2C1_CLK_ENABLE();
-
-    /* I2C1 DMA Init */
-    /* I2C1_RX Init */
-    hdma_i2c1_rx.Instance = DMA1_Stream0;
-    hdma_i2c1_rx.Init.Request = DMA_REQUEST_I2C1_RX;
-    hdma_i2c1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
-    hdma_i2c1_rx.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_i2c1_rx.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_i2c1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-    hdma_i2c1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-    hdma_i2c1_rx.Init.Mode = DMA_NORMAL;
-    hdma_i2c1_rx.Init.Priority = DMA_PRIORITY_HIGH;
-    hdma_i2c1_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
-    if (HAL_DMA_Init(&hdma_i2c1_rx) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    __HAL_LINKDMA(i2cHandle,hdmarx,hdma_i2c1_rx);
-
-    /* I2C1_TX Init */
-    hdma_i2c1_tx.Instance = DMA1_Stream7;
-    hdma_i2c1_tx.Init.Request = DMA_REQUEST_I2C1_TX;
-    hdma_i2c1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
-    hdma_i2c1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_i2c1_tx.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_i2c1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-    hdma_i2c1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-    hdma_i2c1_tx.Init.Mode = DMA_NORMAL;
-    hdma_i2c1_tx.Init.Priority = DMA_PRIORITY_LOW;
-    hdma_i2c1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
-    if (HAL_DMA_Init(&hdma_i2c1_tx) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    __HAL_LINKDMA(i2cHandle,hdmatx,hdma_i2c1_tx);
-
-    /* I2C1 interrupt Init */
-    HAL_NVIC_SetPriority(I2C1_EV_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
-    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
-  /* USER CODE BEGIN I2C1_MspInit 1 */
-
-  /* USER CODE END I2C1_MspInit 1 */
-  }
-}
-
-void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
-{
-
-  if(i2cHandle->Instance==I2C1)
-  {
-  /* USER CODE BEGIN I2C1_MspDeInit 0 */
-
-  /* USER CODE END I2C1_MspDeInit 0 */
-    /* Peripheral clock disable */
-    __HAL_RCC_I2C1_CLK_DISABLE();
-
-    /**I2C1 GPIO Configuration
-    PB8     ------> I2C1_SCL
-    PB9     ------> I2C1_SDA
-    */
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8);
-
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_9);
-
-    /* I2C1 DMA DeInit */
-    HAL_DMA_DeInit(i2cHandle->hdmarx);
-    HAL_DMA_DeInit(i2cHandle->hdmatx);
-
-    /* I2C1 interrupt Deinit */
-    HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
-    HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
-  /* USER CODE BEGIN I2C1_MspDeInit 1 */
-
-  /* USER CODE END I2C1_MspDeInit 1 */
-  }
-}
-
-/* USER CODE BEGIN 1 */
-
-/* USER CODE END 1 */
 </file>
 
 <file path="Core/Src/stm32h7xx_it.c">
@@ -4762,9 +5219,12 @@ extern DMA_HandleTypeDef hdma_spi2_rx;
 extern DMA_HandleTypeDef hdma_spi2_tx;
 extern DMA_HandleTypeDef hdma_spi3_rx;
 extern DMA_HandleTypeDef hdma_spi3_tx;
+extern DMA_HandleTypeDef hdma_spi4_rx;
+extern DMA_HandleTypeDef hdma_spi4_tx;
 extern SPI_HandleTypeDef hspi1;
 extern SPI_HandleTypeDef hspi2;
 extern SPI_HandleTypeDef hspi3;
+extern SPI_HandleTypeDef hspi4;
 extern TIM_HandleTypeDef htim7;
 
 /* USER CODE BEGIN EV */
@@ -5079,9 +5539,144 @@ void TIM7_IRQHandler(void)
   /* USER CODE END TIM7_IRQn 1 */
 }
 
+/**
+  * @brief This function handles DMA2 stream0 global interrupt.
+  */
+void DMA2_Stream0_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA2_Stream0_IRQn 0 */
+
+  /* USER CODE END DMA2_Stream0_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_spi4_rx);
+  /* USER CODE BEGIN DMA2_Stream0_IRQn 1 */
+
+  /* USER CODE END DMA2_Stream0_IRQn 1 */
+}
+
+/**
+  * @brief This function handles DMA2 stream1 global interrupt.
+  */
+void DMA2_Stream1_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA2_Stream1_IRQn 0 */
+
+  /* USER CODE END DMA2_Stream1_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_spi4_tx);
+  /* USER CODE BEGIN DMA2_Stream1_IRQn 1 */
+
+  /* USER CODE END DMA2_Stream1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles SPI4 global interrupt.
+  */
+void SPI4_IRQHandler(void)
+{
+  /* USER CODE BEGIN SPI4_IRQn 0 */
+
+  /* USER CODE END SPI4_IRQn 0 */
+  HAL_SPI_IRQHandler(&hspi4);
+  /* USER CODE BEGIN SPI4_IRQn 1 */
+
+  /* USER CODE END SPI4_IRQn 1 */
+}
+
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
+</file>
+
+<file path="MyCore/Inc/Mydelay.hpp">
+#pragma once 
+#include "main.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// 初始化 DWT 计数器和保活机制
+void DWT_Time_Init(void);
+
+// 传统的微秒延时 (阻塞式)
+void delay_us(uint32_t us);
+
+// 🛑 【核心】获取 64位 纳秒级系统时间戳
+// 特性：线程安全、中断安全、584年不溢出
+uint64_t Get_System_Time_ns(void);
+
+#ifdef __cplusplus
+}
+#endif
+</file>
+
+<file path="MyCore/Src/Mydelay.cpp">
+#include "Mydelay.hpp"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "timers.h" // 引入软件定时器
+
+
+static volatile uint32_t s_last_cyccnt = 0;
+static volatile uint64_t s_total_cycles = 0;
+
+static void TimeBase_KeepAlive_Callback(TimerHandle_t xTimer) {
+    (void)xTimer;
+    Get_System_Time_ns(); // 仅仅调用一次，利用其内部机制更新 s_total_cycles
+}
+
+
+void DWT_Time_Init(void) {
+    // 1. 启用 DWT 硬件
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    
+    // 初始化静态变量
+    s_last_cyccnt = DWT->CYCCNT;
+    s_total_cycles = 0;
+
+    TimerHandle_t hTimer = xTimerCreate(
+        "TimeGuard",             // 名字
+        pdMS_TO_TICKS(4000),     // 周期 4秒 (远小于 8.9秒溢出时间)
+        pdTRUE,                  // 自动重载
+        (void*)0,                // ID
+        TimeBase_KeepAlive_Callback // 回调函数
+    );
+
+    if (hTimer != NULL) {
+        xTimerStart(hTimer, 0); // 启动定时器
+    }
+}
+
+void delay_us(uint32_t us) {
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = us * (SystemCoreClock / 1000000);
+    while ((DWT->CYCCNT - start) < ticks);
+}
+
+uint64_t Get_System_Time_ns(void) {
+
+    uint32_t isr_mask = portSET_INTERRUPT_MASK_FROM_ISR();
+
+    uint32_t current_cyccnt = DWT->CYCCNT;
+
+    uint32_t delta = current_cyccnt - s_last_cyccnt;
+    
+    s_total_cycles += delta;
+    s_last_cyccnt = current_cyccnt;
+
+    uint64_t cycles_copy = s_total_cycles;
+
+    portCLEAR_INTERRUPT_MASK_FROM_ISR(isr_mask);
+    
+    uint64_t seconds = cycles_copy / SystemCoreClock;         // 整数秒
+    uint64_t fraction = cycles_copy % SystemCoreClock;        // 不足一秒的周期数
+
+    uint64_t time_ns = (seconds * 1000000000ULL) + 
+                       ((fraction * 1000000000ULL) / SystemCoreClock);
+
+    return time_ns;
+}
 </file>
 
 <file path="MyDrone.code-workspace">
@@ -5096,13 +5691,13 @@ void TIM7_IRQHandler(void)
 }
 </file>
 
-<file path="Core/Inc/main.h">
+<file path="Core/Src/gpio.c">
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.h
-  * @brief          : Header for main.c file.
-  *                   This file contains the common defines of the application.
+  * @file    gpio.c
+  * @brief   This file provides code for the configuration
+  *          of all used GPIO pins.
   ******************************************************************************
   * @attention
   *
@@ -5117,371 +5712,319 @@ void TIM7_IRQHandler(void)
   */
 /* USER CODE END Header */
 
-/* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __MAIN_H
-#define __MAIN_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* Includes ------------------------------------------------------------------*/
-#include "stm32h7xx_hal.h"
-
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-extern volatile float Mag_Gauss_x;
-extern volatile float Mag_Gauss_y;
-extern volatile float Mag_Gauss_z;
-/* USER CODE END Includes */
-
-/* Exported types ------------------------------------------------------------*/
-/* USER CODE BEGIN ET */
-
-/* USER CODE END ET */
-
-/* Exported constants --------------------------------------------------------*/
-/* USER CODE BEGIN EC */
-
-/* USER CODE END EC */
-
-/* Exported macro ------------------------------------------------------------*/
-/* USER CODE BEGIN EM */
-
-/* USER CODE END EM */
-
-/* Exported functions prototypes ---------------------------------------------*/
-void Error_Handler(void);
-
-/* USER CODE BEGIN EFP */
-
-/* USER CODE END EFP */
-
-/* Private defines -----------------------------------------------------------*/
-#define VCC4_Pin GPIO_PIN_2
-#define VCC4_GPIO_Port GPIOC
-#define GND4_Pin GPIO_PIN_3
-#define GND4_GPIO_Port GPIOC
-#define DPS310_NCS_Pin GPIO_PIN_4
-#define DPS310_NCS_GPIO_Port GPIOA
-#define DPS310_Pin GPIO_PIN_5
-#define DPS310_GPIO_Port GPIOA
-#define PMW3901_NCS_Pin GPIO_PIN_12
-#define PMW3901_NCS_GPIO_Port GPIOB
-#define PMW3901_Pin GPIO_PIN_13
-#define PMW3901_GPIO_Port GPIOB
-#define GND2_Pin GPIO_PIN_6
-#define GND2_GPIO_Port GPIOC
-#define VCC2_Pin GPIO_PIN_7
-#define VCC2_GPIO_Port GPIOC
-#define ICM42688INT_Pin GPIO_PIN_8
-#define ICM42688INT_GPIO_Port GPIOC
-#define ICM42688INT_EXTI_IRQn EXTI9_5_IRQn
-#define GND3_Pin GPIO_PIN_9
-#define GND3_GPIO_Port GPIOA
-#define VCC3_Pin GPIO_PIN_10
-#define VCC3_GPIO_Port GPIOA
-#define VCC1_Pin GPIO_PIN_11
-#define VCC1_GPIO_Port GPIOA
-#define GND1_Pin GPIO_PIN_12
-#define GND1_GPIO_Port GPIOA
-#define ICM42688_Pin GPIO_PIN_10
-#define ICM42688_GPIO_Port GPIOC
-#define ICM42688_NCS_Pin GPIO_PIN_2
-#define ICM42688_NCS_GPIO_Port GPIOD
-
-/* USER CODE BEGIN Private defines */
-
-/* USER CODE END Private defines */
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* __MAIN_H */
-</file>
-
-<file path="Core/Src/main.c">
-/* USER CODE BEGIN Header */
-/**
- ******************************************************************************
- * @file           : main.c
- * @brief          : Main program body
- ******************************************************************************
- * @attention
- *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
- *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
- *
- ******************************************************************************
- */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
-#include "cmsis_os.h"
-#include "dma.h"
 #include "gpio.h"
-#include "i2c.h"
-#include "spi.h"
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include "DTCMinit.h"
-#include "Mydelay.hpp"
-#include "TaskConfig.hpp"
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-volatile float Mag_Gauss_x = 0;
-volatile float Mag_Gauss_y = 0;
-volatile float Mag_Gauss_z = 0;
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-
-/* USER CODE BEGIN PV */
-
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MPU_Config(void);
-void MX_FREERTOS_Init(void);
-/* USER CODE BEGIN PFP */
-
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
 
+/*----------------------------------------------------------------------------*/
+/* Configure GPIO                                                             */
+/*----------------------------------------------------------------------------*/
+/* USER CODE BEGIN 1 */
+
+/* USER CODE END 1 */
+
+/** Configure pins
+     PH0-OSC_IN (PH0)   ------> RCC_OSC_IN
+     PH1-OSC_OUT (PH1)   ------> RCC_OSC_OUT
+     PA13 (JTMS/SWDIO)   ------> DEBUG_JTMS-SWDIO
+     PA14 (JTCK/SWCLK)   ------> DEBUG_JTCK-SWCLK
+*/
+void MX_GPIO_Init(void)
+{
+
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(ICM42688GND_GPIO_Port, ICM42688GND_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(ICM42688VCC_GPIO_Port, ICM42688VCC_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, DPS310VCC_Pin|DPS310_NCS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, DPS310GND_Pin|PMW3901GND_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, PMW3901_NCS_Pin|MMC5983VCC_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, PMW3901VCC_Pin|ICM42688_NCS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(MMC5983GND_GPIO_Port, MMC5983GND_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : ICM42688GND_Pin ICM42688VCC_Pin */
+  GPIO_InitStruct.Pin = ICM42688GND_Pin|ICM42688VCC_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : DPS310VCC_Pin DPS310GND_Pin PMW3901GND_Pin */
+  GPIO_InitStruct.Pin = DPS310VCC_Pin|DPS310GND_Pin|PMW3901GND_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : DPS310_NCS_Pin */
+  GPIO_InitStruct.Pin = DPS310_NCS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(DPS310_NCS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PMW3901_NCS_Pin */
+  GPIO_InitStruct.Pin = PMW3901_NCS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(PMW3901_NCS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PMW3901VCC_Pin */
+  GPIO_InitStruct.Pin = PMW3901VCC_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(PMW3901VCC_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ICM42688INT_Pin */
+  GPIO_InitStruct.Pin = ICM42688INT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(ICM42688INT_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : ICM42688_NCS_Pin */
+  GPIO_InitStruct.Pin = ICM42688_NCS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(ICM42688_NCS_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : MMC5983VCC_Pin MMC5983GND_Pin */
+  GPIO_InitStruct.Pin = MMC5983VCC_Pin|MMC5983GND_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+}
+
+/* USER CODE BEGIN 2 */
+
+/* USER CODE END 2 */
+</file>
+
+<file path="Core/Src/i2c.c">
+/* USER CODE BEGIN Header */
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void)
+  ******************************************************************************
+  * @file    i2c.c
+  * @brief   This file provides code for the configuration
+  *          of the I2C instances.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "i2c.h"
+
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+I2C_HandleTypeDef hi2c1;
+DMA_HandleTypeDef hdma_i2c1_rx;
+DMA_HandleTypeDef hdma_i2c1_tx;
+
+/* I2C1 init function */
+void MX_I2C1_Init(void)
 {
 
-    /* USER CODE BEGIN 1 */
-    System_DTCM_Init(); // 初始化 DTCM 内存
-    /* USER CODE END 1 */
+  /* USER CODE BEGIN I2C1_Init 0 */
 
-    /* MPU Configuration--------------------------------------------------------*/
-    MPU_Config();
+  /* USER CODE END I2C1_Init 0 */
 
-    /* Enable the CPU Cache */
+  /* USER CODE BEGIN I2C1_Init 1 */
 
-    /* Enable I-Cache---------------------------------------------------------*/
-    SCB_EnableICache();
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x307075B1;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    /* Enable D-Cache---------------------------------------------------------*/
-    SCB_EnableDCache();
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
-    /* MCU Configuration--------------------------------------------------------*/
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
 
-    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-    HAL_Init();
+  /* USER CODE END I2C1_Init 2 */
 
-    /* USER CODE BEGIN Init */
-
-    /* USER CODE END Init */
-
-    /* Configure the system clock */
-    SystemClock_Config();
-
-    /* USER CODE BEGIN SysInit */
-    DWT_Time_Init(); // 初始化 DWT 计数器和保活机制
-    /* USER CODE END SysInit */
-
-    /* Initialize all configured peripherals */
-    MX_GPIO_Init();
-    MX_DMA_Init();
-    MX_I2C1_Init();
-    MX_SPI1_Init();
-    MX_SPI2_Init();
-    MX_SPI3_Init();
-    /* USER CODE BEGIN 2 */
-    Bridge_SystemSensors_Init(); // 初始化传感器系统
-    /* USER CODE END 2 */
-
-    /* Init scheduler */
-    osKernelInitialize(); /* Call init function for freertos objects (in cmsis_os2.c) */
-    MX_FREERTOS_Init();
-
-    /* Start scheduler */
-    osKernelStart();
-
-    /* We should never get here as control is now taken by the scheduler */
-
-    /* Infinite loop */
-    /* USER CODE BEGIN WHILE */
-    while (1)
-    {
-        /* USER CODE END WHILE */
-
-        /* USER CODE BEGIN 3 */
-    }
-    /* USER CODE END 3 */
 }
 
-/**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void)
+void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
 {
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    /** Supply configuration update enable
-     */
-    HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  if(i2cHandle->Instance==I2C1)
+  {
+  /* USER CODE BEGIN I2C1_MspInit 0 */
 
-    /** Configure the main internal regulator output voltage
-     */
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+  /* USER CODE END I2C1_MspInit 0 */
 
-    while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY))
+  /** Initializes the peripherals clock
+  */
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
+    PeriphClkInitStruct.I2c123ClockSelection = RCC_I2C123CLKSOURCE_D2PCLK1;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
     {
+      Error_Handler();
     }
 
-    /** Initializes the RCC Oscillators according to the specified parameters
-     * in the RCC_OscInitTypeDef structure.
-     */
-    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM = 5;
-    RCC_OscInitStruct.PLL.PLLN = 192;
-    RCC_OscInitStruct.PLL.PLLP = 2;
-    RCC_OscInitStruct.PLL.PLLQ = 5;
-    RCC_OscInitStruct.PLL.PLLR = 2;
-    RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
-    RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
-    RCC_OscInitStruct.PLL.PLLFRACN = 0;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    /**I2C1 GPIO Configuration
+    PB7     ------> I2C1_SDA
+    PB8     ------> I2C1_SCL
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_7|GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* I2C1 clock enable */
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    /* I2C1 DMA Init */
+    /* I2C1_RX Init */
+    hdma_i2c1_rx.Instance = DMA1_Stream0;
+    hdma_i2c1_rx.Init.Request = DMA_REQUEST_I2C1_RX;
+    hdma_i2c1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_i2c1_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_i2c1_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_i2c1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_i2c1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_i2c1_rx.Init.Mode = DMA_NORMAL;
+    hdma_i2c1_rx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_i2c1_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_i2c1_rx) != HAL_OK)
     {
-        Error_Handler();
+      Error_Handler();
     }
 
-    /** Initializes the CPU, AHB and APB buses clocks
-     */
-    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_D3PCLK1 | RCC_CLOCKTYPE_D1PCLK1;
-    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
-    RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+    __HAL_LINKDMA(i2cHandle,hdmarx,hdma_i2c1_rx);
 
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+    /* I2C1_TX Init */
+    hdma_i2c1_tx.Instance = DMA1_Stream7;
+    hdma_i2c1_tx.Init.Request = DMA_REQUEST_I2C1_TX;
+    hdma_i2c1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_i2c1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_i2c1_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_i2c1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_i2c1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_i2c1_tx.Init.Mode = DMA_NORMAL;
+    hdma_i2c1_tx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_i2c1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_i2c1_tx) != HAL_OK)
     {
-        Error_Handler();
+      Error_Handler();
     }
+
+    __HAL_LINKDMA(i2cHandle,hdmatx,hdma_i2c1_tx);
+
+    /* I2C1 interrupt Init */
+    HAL_NVIC_SetPriority(I2C1_EV_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+    HAL_NVIC_SetPriority(I2C1_ER_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
+  /* USER CODE BEGIN I2C1_MspInit 1 */
+
+  /* USER CODE END I2C1_MspInit 1 */
+  }
 }
 
-/* USER CODE BEGIN 4 */
-
-/* USER CODE END 4 */
-
-/* MPU Configuration */
-
-void MPU_Config(void)
+void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 {
-    MPU_Region_InitTypeDef MPU_InitStruct = {0};
 
-    /* Disables the MPU */
-    HAL_MPU_Disable();
+  if(i2cHandle->Instance==I2C1)
+  {
+  /* USER CODE BEGIN I2C1_MspDeInit 0 */
 
-    /** Initializes and configures the Region and the memory to be protected
-     */
-    MPU_InitStruct.Enable = MPU_REGION_ENABLE;
-    MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-    MPU_InitStruct.BaseAddress = 0x0;
-    MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
-    MPU_InitStruct.SubRegionDisable = 0x87;
-    MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
-    MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
-    MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
-    MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
-    MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
-    MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  /* USER CODE END I2C1_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_I2C1_CLK_DISABLE();
 
-    HAL_MPU_ConfigRegion(&MPU_InitStruct);
-    /* Enables the MPU */
-    HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+    /**I2C1 GPIO Configuration
+    PB7     ------> I2C1_SDA
+    PB8     ------> I2C1_SCL
+    */
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_7);
+
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8);
+
+    /* I2C1 DMA DeInit */
+    HAL_DMA_DeInit(i2cHandle->hdmarx);
+    HAL_DMA_DeInit(i2cHandle->hdmatx);
+
+    /* I2C1 interrupt Deinit */
+    HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+    HAL_NVIC_DisableIRQ(I2C1_ER_IRQn);
+  /* USER CODE BEGIN I2C1_MspDeInit 1 */
+
+  /* USER CODE END I2C1_MspDeInit 1 */
+  }
 }
 
-/**
- * @brief  Period elapsed callback in non blocking mode
- * @note   This function is called  when TIM7 interrupt took place, inside
- * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
- * a global variable "uwTick" used as application time base.
- * @param  htim : TIM handle
- * @retval None
- */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    /* USER CODE BEGIN Callback 0 */
+/* USER CODE BEGIN 1 */
 
-    /* USER CODE END Callback 0 */
-    if (htim->Instance == TIM7)
-    {
-        HAL_IncTick();
-    }
-    /* USER CODE BEGIN Callback 1 */
-
-    /* USER CODE END Callback 1 */
-}
-
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void)
-{
-    /* USER CODE BEGIN Error_Handler_Debug */
-    /* User can add his own implementation to report the HAL error return state */
-    __disable_irq();
-    while (1)
-    {
-    }
-    /* USER CODE END Error_Handler_Debug */
-}
-#ifdef USE_FULL_ASSERT
-/**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-    /* USER CODE BEGIN 6 */
-    /* User can add his own implementation to report the file name and line number,
-       ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-    /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+/* USER CODE END 1 */
 </file>
 
 <file path="Core/Src/spi.c">
@@ -5514,12 +6057,15 @@ void assert_failed(uint8_t *file, uint32_t line)
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
 SPI_HandleTypeDef hspi3;
+SPI_HandleTypeDef hspi4;
 DMA_HandleTypeDef hdma_spi1_rx;
 DMA_HandleTypeDef hdma_spi1_tx;
 DMA_HandleTypeDef hdma_spi2_rx;
 DMA_HandleTypeDef hdma_spi2_tx;
 DMA_HandleTypeDef hdma_spi3_rx;
 DMA_HandleTypeDef hdma_spi3_tx;
+DMA_HandleTypeDef hdma_spi4_rx;
+DMA_HandleTypeDef hdma_spi4_tx;
 
 /* SPI1 init function */
 void MX_SPI1_Init(void)
@@ -5645,6 +6191,47 @@ void MX_SPI3_Init(void)
   /* USER CODE BEGIN SPI3_Init 2 */
 
   /* USER CODE END SPI3_Init 2 */
+
+}
+/* SPI4 init function */
+void MX_SPI4_Init(void)
+{
+
+  /* USER CODE BEGIN SPI4_Init 0 */
+
+  /* USER CODE END SPI4_Init 0 */
+
+  /* USER CODE BEGIN SPI4_Init 1 */
+
+  /* USER CODE END SPI4_Init 1 */
+  hspi4.Instance = SPI4;
+  hspi4.Init.Mode = SPI_MODE_SLAVE;
+  hspi4.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi4.Init.NSS = SPI_NSS_HARD_INPUT;
+  hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi4.Init.CRCPolynomial = 0x0;
+  hspi4.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi4.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
+  hspi4.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
+  hspi4.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi4.Init.RxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
+  hspi4.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
+  hspi4.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
+  hspi4.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
+  hspi4.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi4.Init.IOSwap = SPI_IO_SWAP_DISABLE;
+  if (HAL_SPI_Init(&hspi4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI4_Init 2 */
+
+  /* USER CODE END SPI4_Init 2 */
 
 }
 
@@ -5878,6 +6465,82 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
 
   /* USER CODE END SPI3_MspInit 1 */
   }
+  else if(spiHandle->Instance==SPI4)
+  {
+  /* USER CODE BEGIN SPI4_MspInit 0 */
+
+  /* USER CODE END SPI4_MspInit 0 */
+
+  /** Initializes the peripherals clock
+  */
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SPI4;
+    PeriphClkInitStruct.Spi45ClockSelection = RCC_SPI45CLKSOURCE_D2PCLK1;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* SPI4 clock enable */
+    __HAL_RCC_SPI4_CLK_ENABLE();
+
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    /**SPI4 GPIO Configuration
+    PE2     ------> SPI4_SCK
+    PE5     ------> SPI4_MISO
+    PE6     ------> SPI4_MOSI
+    PE11     ------> SPI4_NSS
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF5_SPI4;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    /* SPI4 DMA Init */
+    /* SPI4_RX Init */
+    hdma_spi4_rx.Instance = DMA2_Stream0;
+    hdma_spi4_rx.Init.Request = DMA_REQUEST_SPI4_RX;
+    hdma_spi4_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
+    hdma_spi4_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi4_rx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi4_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi4_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi4_rx.Init.Mode = DMA_NORMAL;
+    hdma_spi4_rx.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_spi4_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_spi4_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(spiHandle,hdmarx,hdma_spi4_rx);
+
+    /* SPI4_TX Init */
+    hdma_spi4_tx.Instance = DMA2_Stream1;
+    hdma_spi4_tx.Init.Request = DMA_REQUEST_SPI4_TX;
+    hdma_spi4_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_spi4_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_spi4_tx.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_spi4_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_spi4_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+    hdma_spi4_tx.Init.Mode = DMA_NORMAL;
+    hdma_spi4_tx.Init.Priority = DMA_PRIORITY_HIGH;
+    hdma_spi4_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_spi4_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(spiHandle,hdmatx,hdma_spi4_tx);
+
+    /* SPI4 interrupt Init */
+    HAL_NVIC_SetPriority(SPI4_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(SPI4_IRQn);
+  /* USER CODE BEGIN SPI4_MspInit 1 */
+
+  /* USER CODE END SPI4_MspInit 1 */
+  }
 }
 
 void HAL_SPI_MspDeInit(SPI_HandleTypeDef* spiHandle)
@@ -5957,6 +6620,32 @@ void HAL_SPI_MspDeInit(SPI_HandleTypeDef* spiHandle)
   /* USER CODE BEGIN SPI3_MspDeInit 1 */
 
   /* USER CODE END SPI3_MspDeInit 1 */
+  }
+  else if(spiHandle->Instance==SPI4)
+  {
+  /* USER CODE BEGIN SPI4_MspDeInit 0 */
+
+  /* USER CODE END SPI4_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_SPI4_CLK_DISABLE();
+
+    /**SPI4 GPIO Configuration
+    PE2     ------> SPI4_SCK
+    PE5     ------> SPI4_MISO
+    PE6     ------> SPI4_MOSI
+    PE11     ------> SPI4_NSS
+    */
+    HAL_GPIO_DeInit(GPIOE, GPIO_PIN_2|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_11);
+
+    /* SPI4 DMA DeInit */
+    HAL_DMA_DeInit(spiHandle->hdmarx);
+    HAL_DMA_DeInit(spiHandle->hdmatx);
+
+    /* SPI4 interrupt Deinit */
+    HAL_NVIC_DisableIRQ(SPI4_IRQn);
+  /* USER CODE BEGIN SPI4_MspDeInit 1 */
+
+  /* USER CODE END SPI4_MspDeInit 1 */
   }
 }
 
@@ -6090,517 +6779,396 @@ public:
 };
 </file>
 
-<file path="MyDrone.ioc">
-#MicroXplorer Configuration settings - do not modify
-CAD.formats=
-CAD.pinconfig=
-CAD.provider=
-CORTEX_M7.CPU_DCache=Enabled
-CORTEX_M7.CPU_ICache=Enabled
-CORTEX_M7.IPParameters=default_mode_Activation,CPU_ICache,CPU_DCache
-CORTEX_M7.default_mode_Activation=1
-Dma.I2C1_RX.0.Direction=DMA_PERIPH_TO_MEMORY
-Dma.I2C1_RX.0.EventEnable=DISABLE
-Dma.I2C1_RX.0.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.I2C1_RX.0.Instance=DMA1_Stream0
-Dma.I2C1_RX.0.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.I2C1_RX.0.MemInc=DMA_MINC_ENABLE
-Dma.I2C1_RX.0.Mode=DMA_NORMAL
-Dma.I2C1_RX.0.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.I2C1_RX.0.PeriphInc=DMA_PINC_DISABLE
-Dma.I2C1_RX.0.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.I2C1_RX.0.Priority=DMA_PRIORITY_HIGH
-Dma.I2C1_RX.0.RequestNumber=1
-Dma.I2C1_RX.0.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.I2C1_RX.0.SignalID=NONE
-Dma.I2C1_RX.0.SyncEnable=DISABLE
-Dma.I2C1_RX.0.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.I2C1_RX.0.SyncRequestNumber=1
-Dma.I2C1_RX.0.SyncSignalID=NONE
-Dma.I2C1_TX.7.Direction=DMA_MEMORY_TO_PERIPH
-Dma.I2C1_TX.7.EventEnable=DISABLE
-Dma.I2C1_TX.7.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.I2C1_TX.7.Instance=DMA1_Stream7
-Dma.I2C1_TX.7.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.I2C1_TX.7.MemInc=DMA_MINC_ENABLE
-Dma.I2C1_TX.7.Mode=DMA_NORMAL
-Dma.I2C1_TX.7.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.I2C1_TX.7.PeriphInc=DMA_PINC_DISABLE
-Dma.I2C1_TX.7.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.I2C1_TX.7.Priority=DMA_PRIORITY_LOW
-Dma.I2C1_TX.7.RequestNumber=1
-Dma.I2C1_TX.7.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.I2C1_TX.7.SignalID=NONE
-Dma.I2C1_TX.7.SyncEnable=DISABLE
-Dma.I2C1_TX.7.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.I2C1_TX.7.SyncRequestNumber=1
-Dma.I2C1_TX.7.SyncSignalID=NONE
-Dma.Request0=I2C1_RX
-Dma.Request1=SPI1_RX
-Dma.Request2=SPI1_TX
-Dma.Request3=SPI2_RX
-Dma.Request4=SPI2_TX
-Dma.Request5=SPI3_RX
-Dma.Request6=SPI3_TX
-Dma.Request7=I2C1_TX
-Dma.RequestsNb=8
-Dma.SPI1_RX.1.Direction=DMA_PERIPH_TO_MEMORY
-Dma.SPI1_RX.1.EventEnable=DISABLE
-Dma.SPI1_RX.1.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI1_RX.1.Instance=DMA1_Stream1
-Dma.SPI1_RX.1.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI1_RX.1.MemInc=DMA_MINC_ENABLE
-Dma.SPI1_RX.1.Mode=DMA_NORMAL
-Dma.SPI1_RX.1.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI1_RX.1.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI1_RX.1.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI1_RX.1.Priority=DMA_PRIORITY_LOW
-Dma.SPI1_RX.1.RequestNumber=1
-Dma.SPI1_RX.1.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI1_RX.1.SignalID=NONE
-Dma.SPI1_RX.1.SyncEnable=DISABLE
-Dma.SPI1_RX.1.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI1_RX.1.SyncRequestNumber=1
-Dma.SPI1_RX.1.SyncSignalID=NONE
-Dma.SPI1_TX.2.Direction=DMA_MEMORY_TO_PERIPH
-Dma.SPI1_TX.2.EventEnable=DISABLE
-Dma.SPI1_TX.2.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI1_TX.2.Instance=DMA1_Stream2
-Dma.SPI1_TX.2.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI1_TX.2.MemInc=DMA_MINC_ENABLE
-Dma.SPI1_TX.2.Mode=DMA_NORMAL
-Dma.SPI1_TX.2.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI1_TX.2.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI1_TX.2.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI1_TX.2.Priority=DMA_PRIORITY_LOW
-Dma.SPI1_TX.2.RequestNumber=1
-Dma.SPI1_TX.2.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI1_TX.2.SignalID=NONE
-Dma.SPI1_TX.2.SyncEnable=DISABLE
-Dma.SPI1_TX.2.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI1_TX.2.SyncRequestNumber=1
-Dma.SPI1_TX.2.SyncSignalID=NONE
-Dma.SPI2_RX.3.Direction=DMA_PERIPH_TO_MEMORY
-Dma.SPI2_RX.3.EventEnable=DISABLE
-Dma.SPI2_RX.3.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI2_RX.3.Instance=DMA1_Stream3
-Dma.SPI2_RX.3.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI2_RX.3.MemInc=DMA_MINC_ENABLE
-Dma.SPI2_RX.3.Mode=DMA_NORMAL
-Dma.SPI2_RX.3.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI2_RX.3.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI2_RX.3.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI2_RX.3.Priority=DMA_PRIORITY_LOW
-Dma.SPI2_RX.3.RequestNumber=1
-Dma.SPI2_RX.3.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI2_RX.3.SignalID=NONE
-Dma.SPI2_RX.3.SyncEnable=DISABLE
-Dma.SPI2_RX.3.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI2_RX.3.SyncRequestNumber=1
-Dma.SPI2_RX.3.SyncSignalID=NONE
-Dma.SPI2_TX.4.Direction=DMA_MEMORY_TO_PERIPH
-Dma.SPI2_TX.4.EventEnable=DISABLE
-Dma.SPI2_TX.4.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI2_TX.4.Instance=DMA1_Stream4
-Dma.SPI2_TX.4.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI2_TX.4.MemInc=DMA_MINC_ENABLE
-Dma.SPI2_TX.4.Mode=DMA_NORMAL
-Dma.SPI2_TX.4.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI2_TX.4.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI2_TX.4.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI2_TX.4.Priority=DMA_PRIORITY_LOW
-Dma.SPI2_TX.4.RequestNumber=1
-Dma.SPI2_TX.4.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI2_TX.4.SignalID=NONE
-Dma.SPI2_TX.4.SyncEnable=DISABLE
-Dma.SPI2_TX.4.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI2_TX.4.SyncRequestNumber=1
-Dma.SPI2_TX.4.SyncSignalID=NONE
-Dma.SPI3_RX.5.Direction=DMA_PERIPH_TO_MEMORY
-Dma.SPI3_RX.5.EventEnable=DISABLE
-Dma.SPI3_RX.5.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI3_RX.5.Instance=DMA1_Stream5
-Dma.SPI3_RX.5.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI3_RX.5.MemInc=DMA_MINC_ENABLE
-Dma.SPI3_RX.5.Mode=DMA_NORMAL
-Dma.SPI3_RX.5.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI3_RX.5.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI3_RX.5.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI3_RX.5.Priority=DMA_PRIORITY_LOW
-Dma.SPI3_RX.5.RequestNumber=1
-Dma.SPI3_RX.5.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI3_RX.5.SignalID=NONE
-Dma.SPI3_RX.5.SyncEnable=DISABLE
-Dma.SPI3_RX.5.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI3_RX.5.SyncRequestNumber=1
-Dma.SPI3_RX.5.SyncSignalID=NONE
-Dma.SPI3_TX.6.Direction=DMA_MEMORY_TO_PERIPH
-Dma.SPI3_TX.6.EventEnable=DISABLE
-Dma.SPI3_TX.6.FIFOMode=DMA_FIFOMODE_DISABLE
-Dma.SPI3_TX.6.Instance=DMA1_Stream6
-Dma.SPI3_TX.6.MemDataAlignment=DMA_MDATAALIGN_BYTE
-Dma.SPI3_TX.6.MemInc=DMA_MINC_ENABLE
-Dma.SPI3_TX.6.Mode=DMA_NORMAL
-Dma.SPI3_TX.6.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
-Dma.SPI3_TX.6.PeriphInc=DMA_PINC_DISABLE
-Dma.SPI3_TX.6.Polarity=HAL_DMAMUX_REQ_GEN_RISING
-Dma.SPI3_TX.6.Priority=DMA_PRIORITY_LOW
-Dma.SPI3_TX.6.RequestNumber=1
-Dma.SPI3_TX.6.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
-Dma.SPI3_TX.6.SignalID=NONE
-Dma.SPI3_TX.6.SyncEnable=DISABLE
-Dma.SPI3_TX.6.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
-Dma.SPI3_TX.6.SyncRequestNumber=1
-Dma.SPI3_TX.6.SyncSignalID=NONE
-FREERTOS.HEAP_NUMBER=4
-FREERTOS.IPParameters=Tasks01,configENABLE_FPU,configTOTAL_HEAP_SIZE,configCHECK_FOR_STACK_OVERFLOW,configTIMER_TASK_PRIORITY,HEAP_NUMBER
-FREERTOS.Tasks01=defaultTask,24,128,StartDefaultTask,Default,NULL,Dynamic,NULL,NULL
-FREERTOS.configCHECK_FOR_STACK_OVERFLOW=2
-FREERTOS.configENABLE_FPU=1
-FREERTOS.configTIMER_TASK_PRIORITY=40
-FREERTOS.configTOTAL_HEAP_SIZE=131072
-File.Version=6
-GPIO.groupedBy=Show All
-I2C1.I2C_Speed_Mode=I2C_Standard
-I2C1.IPParameters=Timing,I2C_Speed_Mode
-I2C1.Timing=0x307075B1
-KeepUserPlacement=false
-MMTAppRegionsCount=0
-MMTConfigApplied=false
-MMTSectionSuffix=
-Mcu.CPN=STM32H743VIT6
-Mcu.Family=STM32H7
-Mcu.IP0=CORTEX_M7
-Mcu.IP1=DEBUG
-Mcu.IP10=SPI3
-Mcu.IP11=SYS
-Mcu.IP2=DMA
-Mcu.IP3=FREERTOS
-Mcu.IP4=I2C1
-Mcu.IP5=MEMORYMAP
-Mcu.IP6=NVIC
-Mcu.IP7=RCC
-Mcu.IP8=SPI1
-Mcu.IP9=SPI2
-Mcu.IPNb=12
-Mcu.Name=STM32H743VITx
-Mcu.Package=LQFP100
-Mcu.Pin0=PH0-OSC_IN (PH0)
-Mcu.Pin1=PH1-OSC_OUT (PH1)
-Mcu.Pin10=PB14
-Mcu.Pin11=PB15
-Mcu.Pin12=PC6
-Mcu.Pin13=PC7
-Mcu.Pin14=PC8
-Mcu.Pin15=PA9
-Mcu.Pin16=PA10
-Mcu.Pin17=PA11
-Mcu.Pin18=PA12
-Mcu.Pin19=PA13 (JTMS/SWDIO)
-Mcu.Pin2=PC2_C
-Mcu.Pin20=PA14 (JTCK/SWCLK)
-Mcu.Pin21=PC10
-Mcu.Pin22=PC11
-Mcu.Pin23=PC12
-Mcu.Pin24=PD2
-Mcu.Pin25=PB8
-Mcu.Pin26=PB9
-Mcu.Pin27=VP_FREERTOS_VS_CMSIS_V2
-Mcu.Pin28=VP_SYS_VS_tim7
-Mcu.Pin29=VP_MEMORYMAP_VS_MEMORYMAP
-Mcu.Pin3=PC3_C
-Mcu.Pin4=PA4
-Mcu.Pin5=PA5
-Mcu.Pin6=PA6
-Mcu.Pin7=PA7
-Mcu.Pin8=PB12
-Mcu.Pin9=PB13
-Mcu.PinsNb=30
-Mcu.ThirdPartyNb=0
-Mcu.UserConstants=
-Mcu.UserName=STM32H743VITx
-MxCube.Version=6.16.1
-MxDb.Version=DB.6.0.161
-NVIC.BusFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-NVIC.DMA1_Stream0_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream1_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream2_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream3_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream4_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream5_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream6_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DMA1_Stream7_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.DebugMonitor_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-NVIC.EXTI9_5_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
-NVIC.ForceEnableDMAVector=true
-NVIC.HardFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-NVIC.I2C1_ER_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
-NVIC.I2C1_EV_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
-NVIC.MemoryManagement_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-NVIC.NonMaskableInt_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-NVIC.PendSV_IRQn=true\:15\:0\:false\:false\:false\:true\:false\:false\:false
-NVIC.PriorityGroup=NVIC_PRIORITYGROUP_4
-NVIC.SPI1_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.SPI2_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.SPI3_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
-NVIC.SVCall_IRQn=true\:0\:0\:false\:false\:false\:false\:false\:false\:false
-NVIC.SavedPendsvIrqHandlerGenerated=true
-NVIC.SavedSvcallIrqHandlerGenerated=true
-NVIC.SavedSystickIrqHandlerGenerated=true
-NVIC.SysTick_IRQn=true\:15\:0\:false\:false\:false\:true\:false\:true\:false
-NVIC.TIM7_IRQn=true\:15\:0\:true\:false\:true\:false\:false\:true\:true
-NVIC.TimeBase=TIM7_IRQn
-NVIC.TimeBaseIP=TIM7
-NVIC.UsageFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
-PA10.GPIOParameters=PinState,GPIO_Label
-PA10.GPIO_Label=VCC3
-PA10.Locked=true
-PA10.PinState=GPIO_PIN_SET
-PA10.Signal=GPIO_Output
-PA11.GPIOParameters=PinState,GPIO_Label
-PA11.GPIO_Label=VCC1
-PA11.Locked=true
-PA11.PinState=GPIO_PIN_SET
-PA11.Signal=GPIO_Output
-PA12.GPIOParameters=GPIO_Label
-PA12.GPIO_Label=GND1
-PA12.Locked=true
-PA12.Signal=GPIO_Output
-PA13\ (JTMS/SWDIO).Mode=Serial_Wire
-PA13\ (JTMS/SWDIO).Signal=DEBUG_JTMS-SWDIO
-PA14\ (JTCK/SWCLK).Mode=Serial_Wire
-PA14\ (JTCK/SWCLK).Signal=DEBUG_JTCK-SWCLK
-PA4.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
-PA4.GPIO_Label=DPS310_NCS
-PA4.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
-PA4.Locked=true
-PA4.PinState=GPIO_PIN_SET
-PA4.Signal=GPIO_Output
-PA5.GPIOParameters=GPIO_Label
-PA5.GPIO_Label=DPS310
-PA5.Mode=Full_Duplex_Master
-PA5.Signal=SPI1_SCK
-PA6.Mode=Full_Duplex_Master
-PA6.Signal=SPI1_MISO
-PA7.Mode=Full_Duplex_Master
-PA7.Signal=SPI1_MOSI
-PA9.GPIOParameters=GPIO_Label
-PA9.GPIO_Label=GND3
-PA9.Locked=true
-PA9.Signal=GPIO_Output
-PB12.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
-PB12.GPIO_Label=PMW3901_NCS
-PB12.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
-PB12.Locked=true
-PB12.PinState=GPIO_PIN_SET
-PB12.Signal=GPIO_Output
-PB13.GPIOParameters=GPIO_Label
-PB13.GPIO_Label=PMW3901
-PB13.Locked=true
-PB13.Mode=Full_Duplex_Master
-PB13.Signal=SPI2_SCK
-PB14.Locked=true
-PB14.Mode=Full_Duplex_Master
-PB14.Signal=SPI2_MISO
-PB15.Locked=true
-PB15.Mode=Full_Duplex_Master
-PB15.Signal=SPI2_MOSI
-PB8.Locked=true
-PB8.Mode=I2C
-PB8.Signal=I2C1_SCL
-PB9.Locked=true
-PB9.Mode=I2C
-PB9.Signal=I2C1_SDA
-PC10.GPIOParameters=GPIO_Label
-PC10.GPIO_Label=ICM42688
-PC10.Mode=Full_Duplex_Master
-PC10.Signal=SPI3_SCK
-PC11.Mode=Full_Duplex_Master
-PC11.Signal=SPI3_MISO
-PC12.Locked=true
-PC12.Mode=Full_Duplex_Master
-PC12.Signal=SPI3_MOSI
-PC2_C.GPIOParameters=PinState,GPIO_Label
-PC2_C.GPIO_Label=VCC4
-PC2_C.Locked=true
-PC2_C.PinState=GPIO_PIN_SET
-PC2_C.Signal=GPIO_Output
-PC3_C.GPIOParameters=GPIO_Label
-PC3_C.GPIO_Label=GND4
-PC3_C.Locked=true
-PC3_C.Signal=GPIO_Output
-PC6.GPIOParameters=GPIO_Label
-PC6.GPIO_Label=GND2
-PC6.Locked=true
-PC6.Signal=GPIO_Output
-PC7.GPIOParameters=PinState,GPIO_Label
-PC7.GPIO_Label=VCC2
-PC7.Locked=true
-PC7.PinState=GPIO_PIN_SET
-PC7.Signal=GPIO_Output
-PC8.GPIOParameters=GPIO_Label
-PC8.GPIO_Label=ICM42688INT
-PC8.Locked=true
-PC8.Signal=GPXTI8
-PD2.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
-PD2.GPIO_Label=ICM42688_NCS
-PD2.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
-PD2.Locked=true
-PD2.PinState=GPIO_PIN_SET
-PD2.Signal=GPIO_Output
-PH0-OSC_IN\ (PH0).Mode=HSE-External-Oscillator
-PH0-OSC_IN\ (PH0).Signal=RCC_OSC_IN
-PH1-OSC_OUT\ (PH1).Mode=HSE-External-Oscillator
-PH1-OSC_OUT\ (PH1).Signal=RCC_OSC_OUT
-PinOutPanel.RotationAngle=0
-ProjectManager.AskForMigrate=true
-ProjectManager.BackupPrevious=false
-ProjectManager.CompilerLinker=GCC
-ProjectManager.CompilerOptimize=6
-ProjectManager.ComputerToolchain=false
-ProjectManager.CoupleFile=true
-ProjectManager.CustomerFirmwarePackage=
-ProjectManager.DefaultFWLocation=true
-ProjectManager.DeletePrevious=true
-ProjectManager.DeviceId=STM32H743VITx
-ProjectManager.FirmwarePackage=STM32Cube FW_H7 V1.12.1
-ProjectManager.FreePins=false
-ProjectManager.FreePinsContext=
-ProjectManager.HalAssertFull=false
-ProjectManager.HeapSize=0x200
-ProjectManager.KeepUserCode=true
-ProjectManager.LastFirmware=true
-ProjectManager.LibraryCopy=1
-ProjectManager.MainLocation=Core/Src
-ProjectManager.NoMain=false
-ProjectManager.PreviousToolchain=STM32CubeIDE
-ProjectManager.ProjectBuild=false
-ProjectManager.ProjectFileName=MyDrone.ioc
-ProjectManager.ProjectName=MyDrone
-ProjectManager.ProjectStructure=
-ProjectManager.RegisterCallBack=
-ProjectManager.StackSize=0x400
-ProjectManager.TargetToolchain=STM32CubeIDE
-ProjectManager.ToolChainLocation=
-ProjectManager.UAScriptAfterPath=
-ProjectManager.UAScriptBeforePath=
-ProjectManager.UnderRoot=true
-ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_I2C1_Init-I2C1-false-HAL-true,5-MX_SPI1_Init-SPI1-false-HAL-true,6-MX_SPI2_Init-SPI2-false-HAL-true,7-MX_SPI3_Init-SPI3-false-HAL-true,0-MX_CORTEX_M7_Init-CORTEX_M7-false-HAL-true
-RCC.ADCFreq_Value=50390625
-RCC.AHB12Freq_Value=240000000
-RCC.AHB4Freq_Value=240000000
-RCC.APB1Freq_Value=120000000
-RCC.APB2Freq_Value=120000000
-RCC.APB3Freq_Value=120000000
-RCC.APB4Freq_Value=120000000
-RCC.AXIClockFreq_Value=240000000
-RCC.CECFreq_Value=32000
-RCC.CKPERFreq_Value=64000000
-RCC.CortexFreq_Value=480000000
-RCC.CpuClockFreq_Value=480000000
-RCC.D1CPREFreq_Value=480000000
-RCC.D1PPRE=RCC_APB3_DIV2
-RCC.D2PPRE1=RCC_APB1_DIV2
-RCC.D2PPRE2=RCC_APB2_DIV2
-RCC.D3PPRE=RCC_APB4_DIV2
-RCC.DFSDMACLkFreq_Value=192000000
-RCC.DFSDMFreq_Value=120000000
-RCC.DIVM1=5
-RCC.DIVN1=192
-RCC.DIVP1Freq_Value=480000000
-RCC.DIVP2Freq_Value=50390625
-RCC.DIVP3Freq_Value=50390625
-RCC.DIVQ1=5
-RCC.DIVQ1Freq_Value=192000000
-RCC.DIVQ2Freq_Value=50390625
-RCC.DIVQ3Freq_Value=50390625
-RCC.DIVR1Freq_Value=480000000
-RCC.DIVR2Freq_Value=50390625
-RCC.DIVR3Freq_Value=50390625
-RCC.FDCANFreq_Value=192000000
-RCC.FMCFreq_Value=240000000
-RCC.FamilyName=M
-RCC.HCLK3ClockFreq_Value=240000000
-RCC.HCLKFreq_Value=240000000
-RCC.HPRE=RCC_HCLK_DIV2
-RCC.HRTIMFreq_Value=240000000
-RCC.I2C123Freq_Value=120000000
-RCC.I2C4Freq_Value=120000000
-RCC.IPParameters=ADCFreq_Value,AHB12Freq_Value,AHB4Freq_Value,APB1Freq_Value,APB2Freq_Value,APB3Freq_Value,APB4Freq_Value,AXIClockFreq_Value,CECFreq_Value,CKPERFreq_Value,CortexFreq_Value,CpuClockFreq_Value,D1CPREFreq_Value,D1PPRE,D2PPRE1,D2PPRE2,D3PPRE,DFSDMACLkFreq_Value,DFSDMFreq_Value,DIVM1,DIVN1,DIVP1Freq_Value,DIVP2Freq_Value,DIVP3Freq_Value,DIVQ1,DIVQ1Freq_Value,DIVQ2Freq_Value,DIVQ3Freq_Value,DIVR1Freq_Value,DIVR2Freq_Value,DIVR3Freq_Value,FDCANFreq_Value,FMCFreq_Value,FamilyName,HCLK3ClockFreq_Value,HCLKFreq_Value,HPRE,HRTIMFreq_Value,I2C123Freq_Value,I2C4Freq_Value,LPTIM1Freq_Value,LPTIM2Freq_Value,LPTIM345Freq_Value,LPUART1Freq_Value,LTDCFreq_Value,MCO1PinFreq_Value,MCO2PinFreq_Value,PLLFRACN,PLLSourceVirtual,PWR_Regulator_Voltage_Scale,QSPIFreq_Value,RNGFreq_Value,RTCFreq_Value,SAI1Freq_Value,SAI23Freq_Value,SAI4AFreq_Value,SAI4BFreq_Value,SDMMCFreq_Value,SPDIFRXFreq_Value,SPI123Freq_Value,SPI45Freq_Value,SPI6Freq_Value,SWPMI1Freq_Value,SYSCLKFreq_VALUE,SYSCLKSource,Tim1OutputFreq_Value,Tim2OutputFreq_Value,TraceFreq_Value,USART16Freq_Value,USART234578Freq_Value,USBFreq_Value,VCO1OutputFreq_Value,VCO2OutputFreq_Value,VCO3OutputFreq_Value,VCOInput1Freq_Value,VCOInput2Freq_Value,VCOInput3Freq_Value
-RCC.LPTIM1Freq_Value=120000000
-RCC.LPTIM2Freq_Value=120000000
-RCC.LPTIM345Freq_Value=120000000
-RCC.LPUART1Freq_Value=120000000
-RCC.LTDCFreq_Value=50390625
-RCC.MCO1PinFreq_Value=64000000
-RCC.MCO2PinFreq_Value=480000000
-RCC.PLLFRACN=0
-RCC.PLLSourceVirtual=RCC_PLLSOURCE_HSE
-RCC.PWR_Regulator_Voltage_Scale=PWR_REGULATOR_VOLTAGE_SCALE0
-RCC.QSPIFreq_Value=240000000
-RCC.RNGFreq_Value=48000000
-RCC.RTCFreq_Value=32000
-RCC.SAI1Freq_Value=192000000
-RCC.SAI23Freq_Value=192000000
-RCC.SAI4AFreq_Value=192000000
-RCC.SAI4BFreq_Value=192000000
-RCC.SDMMCFreq_Value=192000000
-RCC.SPDIFRXFreq_Value=192000000
-RCC.SPI123Freq_Value=192000000
-RCC.SPI45Freq_Value=120000000
-RCC.SPI6Freq_Value=120000000
-RCC.SWPMI1Freq_Value=120000000
-RCC.SYSCLKFreq_VALUE=480000000
-RCC.SYSCLKSource=RCC_SYSCLKSOURCE_PLLCLK
-RCC.Tim1OutputFreq_Value=240000000
-RCC.Tim2OutputFreq_Value=240000000
-RCC.TraceFreq_Value=480000000
-RCC.USART16Freq_Value=120000000
-RCC.USART234578Freq_Value=120000000
-RCC.USBFreq_Value=192000000
-RCC.VCO1OutputFreq_Value=960000000
-RCC.VCO2OutputFreq_Value=100781250
-RCC.VCO3OutputFreq_Value=100781250
-RCC.VCOInput1Freq_Value=5000000
-RCC.VCOInput2Freq_Value=781250
-RCC.VCOInput3Freq_Value=781250
-SH.GPXTI8.0=GPIO_EXTI8
-SH.GPXTI8.ConfNb=1
-SPI1.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_32
-SPI1.CLKPhase=SPI_PHASE_2EDGE
-SPI1.CLKPolarity=SPI_POLARITY_HIGH
-SPI1.CalculateBaudRate=6.0 MBits/s
-SPI1.DataSize=SPI_DATASIZE_8BIT
-SPI1.Direction=SPI_DIRECTION_2LINES
-SPI1.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,CLKPolarity,CLKPhase,DataSize
-SPI1.Mode=SPI_MODE_MASTER
-SPI1.VirtualType=VM_MASTER
-SPI2.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_128
-SPI2.CLKPhase=SPI_PHASE_2EDGE
-SPI2.CLKPolarity=SPI_POLARITY_HIGH
-SPI2.CalculateBaudRate=1.5 MBits/s
-SPI2.DataSize=SPI_DATASIZE_8BIT
-SPI2.Direction=SPI_DIRECTION_2LINES
-SPI2.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,DataSize,CLKPolarity,CLKPhase
-SPI2.Mode=SPI_MODE_MASTER
-SPI2.VirtualType=VM_MASTER
-SPI3.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_16
-SPI3.CLKPhase=SPI_PHASE_2EDGE
-SPI3.CLKPolarity=SPI_POLARITY_HIGH
-SPI3.CalculateBaudRate=12.0 MBits/s
-SPI3.DataSize=SPI_DATASIZE_8BIT
-SPI3.Direction=SPI_DIRECTION_2LINES
-SPI3.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,DataSize,CLKPolarity,CLKPhase
-SPI3.Mode=SPI_MODE_MASTER
-SPI3.VirtualType=VM_MASTER
-VP_FREERTOS_VS_CMSIS_V2.Mode=CMSIS_V2
-VP_FREERTOS_VS_CMSIS_V2.Signal=FREERTOS_VS_CMSIS_V2
-VP_MEMORYMAP_VS_MEMORYMAP.Mode=CurAppReg
-VP_MEMORYMAP_VS_MEMORYMAP.Signal=MEMORYMAP_VS_MEMORYMAP
-VP_SYS_VS_tim7.Mode=TIM7
-VP_SYS_VS_tim7.Signal=SYS_VS_tim7
-board=custom
-rtos.0.ip=FREERTOS
+<file path="Core/Inc/main.h">
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.h
+  * @brief          : Header for main.c file.
+  *                   This file contains the common defines of the application.
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Define to prevent recursive inclusion -------------------------------------*/
+#ifndef __MAIN_H
+#define __MAIN_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Includes ------------------------------------------------------------------*/
+#include "stm32h7xx_hal.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+extern volatile float Mag_Gauss_x;
+extern volatile float Mag_Gauss_y;
+extern volatile float Mag_Gauss_z;
+/* USER CODE END Includes */
+
+/* Exported types ------------------------------------------------------------*/
+/* USER CODE BEGIN ET */
+
+/* USER CODE END ET */
+
+/* Exported constants --------------------------------------------------------*/
+/* USER CODE BEGIN EC */
+
+/* USER CODE END EC */
+
+/* Exported macro ------------------------------------------------------------*/
+/* USER CODE BEGIN EM */
+
+/* USER CODE END EM */
+
+/* Exported functions prototypes ---------------------------------------------*/
+void Error_Handler(void);
+
+/* USER CODE BEGIN EFP */
+
+/* USER CODE END EFP */
+
+/* Private defines -----------------------------------------------------------*/
+#define ICM42688GND_Pin GPIO_PIN_3
+#define ICM42688GND_GPIO_Port GPIOE
+#define ICM42688VCC_Pin GPIO_PIN_4
+#define ICM42688VCC_GPIO_Port GPIOE
+#define DPS310VCC_Pin GPIO_PIN_2
+#define DPS310VCC_GPIO_Port GPIOA
+#define DPS310GND_Pin GPIO_PIN_3
+#define DPS310GND_GPIO_Port GPIOA
+#define DPS310_NCS_Pin GPIO_PIN_4
+#define DPS310_NCS_GPIO_Port GPIOA
+#define DPS310_Pin GPIO_PIN_5
+#define DPS310_GPIO_Port GPIOA
+#define PMW3901_NCS_Pin GPIO_PIN_12
+#define PMW3901_NCS_GPIO_Port GPIOB
+#define PMW3901_Pin GPIO_PIN_13
+#define PMW3901_GPIO_Port GPIOB
+#define PMW3901VCC_Pin GPIO_PIN_14
+#define PMW3901VCC_GPIO_Port GPIOD
+#define ICM42688INT_Pin GPIO_PIN_8
+#define ICM42688INT_GPIO_Port GPIOC
+#define ICM42688INT_EXTI_IRQn EXTI9_5_IRQn
+#define PMW3901GND_Pin GPIO_PIN_15
+#define PMW3901GND_GPIO_Port GPIOA
+#define ICM42688_Pin GPIO_PIN_10
+#define ICM42688_GPIO_Port GPIOC
+#define ICM42688_NCS_Pin GPIO_PIN_2
+#define ICM42688_NCS_GPIO_Port GPIOD
+#define MMC5983VCC_Pin GPIO_PIN_4
+#define MMC5983VCC_GPIO_Port GPIOB
+#define MMC5983GND_Pin GPIO_PIN_5
+#define MMC5983GND_GPIO_Port GPIOB
+
+/* USER CODE BEGIN Private defines */
+
+/* USER CODE END Private defines */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __MAIN_H */
+</file>
+
+<file path="Core/Src/main.c">
+/* USER CODE BEGIN Header */
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2026 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+#include "dma.h"
+#include "gpio.h"
+#include "i2c.h"
+#include "spi.h"
+#include "tim.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "DTCMinit.h"
+#include "Mydelay.hpp"
+#include "TaskConfig.hpp"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+volatile float Mag_Gauss_x = 0;
+volatile float Mag_Gauss_y = 0;
+volatile float Mag_Gauss_z = 0;
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MPU_Config(void);
+void MX_FREERTOS_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void)
+{
+
+    /* USER CODE BEGIN 1 */
+    System_DTCM_Init(); // 初始化 DTCM 内存
+    /* USER CODE END 1 */
+
+    /* MPU Configuration--------------------------------------------------------*/
+    MPU_Config();
+
+    /* Enable the CPU Cache */
+
+    /* Enable I-Cache---------------------------------------------------------*/
+    SCB_EnableICache();
+
+    /* Enable D-Cache---------------------------------------------------------*/
+    SCB_EnableDCache();
+
+    /* MCU Configuration--------------------------------------------------------*/
+
+    /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+    HAL_Init();
+
+    /* USER CODE BEGIN Init */
+
+    /* USER CODE END Init */
+
+    /* Configure the system clock */
+    SystemClock_Config();
+
+    /* USER CODE BEGIN SysInit */
+    DWT_Time_Init(); // 初始化 DWT 计数器
+    /* USER CODE END SysInit */
+
+    /* Initialize all configured peripherals */
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_SPI1_Init();
+    MX_SPI2_Init();
+    MX_SPI3_Init();
+    MX_TIM2_Init();
+    MX_TIM4_Init();
+    MX_I2C1_Init();
+    MX_SPI4_Init();
+    /* USER CODE BEGIN 2 */
+    Bridge_SystemSensors_Init(); // 初始化传感器系统
+    /* USER CODE END 2 */
+
+    /* Init scheduler */
+    osKernelInitialize(); /* Call init function for freertos objects (in cmsis_os2.c) */
+    MX_FREERTOS_Init();
+
+    /* Start scheduler */
+    osKernelStart();
+
+    /* We should never get here as control is now taken by the scheduler */
+
+    /* Infinite loop */
+    /* USER CODE BEGIN WHILE */
+    while (1)
+    {
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+    }
+    /* USER CODE END 3 */
+}
+
+/**
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    /** Supply configuration update enable
+     */
+    HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+
+    /** Configure the main internal regulator output voltage
+     */
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
+    while (!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY))
+    {
+    }
+
+    /** Initializes the RCC Oscillators according to the specified parameters
+     * in the RCC_OscInitTypeDef structure.
+     */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM = 5;
+    RCC_OscInitStruct.PLL.PLLN = 192;
+    RCC_OscInitStruct.PLL.PLLP = 2;
+    RCC_OscInitStruct.PLL.PLLQ = 5;
+    RCC_OscInitStruct.PLL.PLLR = 2;
+    RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
+    RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
+    RCC_OscInitStruct.PLL.PLLFRACN = 0;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /** Initializes the CPU, AHB and APB buses clocks
+     */
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_D3PCLK1 | RCC_CLOCKTYPE_D1PCLK1;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
+    RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/* MPU Configuration */
+
+void MPU_Config(void)
+{
+    MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+    /* Disables the MPU */
+    HAL_MPU_Disable();
+
+    /** Initializes and configures the Region and the memory to be protected
+     */
+    MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+    MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+    MPU_InitStruct.BaseAddress = 0x0;
+    MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
+    MPU_InitStruct.SubRegionDisable = 0x87;
+    MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+    MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+    MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+    MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+    MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+    MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+    HAL_MPU_ConfigRegion(&MPU_InitStruct);
+    /* Enables the MPU */
+    HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+}
+
+/**
+ * @brief  Period elapsed callback in non blocking mode
+ * @note   This function is called  when TIM7 interrupt took place, inside
+ * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+ * a global variable "uwTick" used as application time base.
+ * @param  htim : TIM handle
+ * @retval None
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    /* USER CODE BEGIN Callback 0 */
+
+    /* USER CODE END Callback 0 */
+    if (htim->Instance == TIM7)
+    {
+        HAL_IncTick();
+    }
+    /* USER CODE BEGIN Callback 1 */
+
+    /* USER CODE END Callback 1 */
+}
+
+/**
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void)
+{
+    /* USER CODE BEGIN Error_Handler_Debug */
+    /* User can add his own implementation to report the HAL error return state */
+    __disable_irq();
+    while (1)
+    {
+    }
+    /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+ * @brief  Reports the name of the source file and the source line number
+ *         where the assert_param error has occurred.
+ * @param  file: pointer to the source file name
+ * @param  line: assert_param error line source number
+ * @retval None
+ */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    /* USER CODE BEGIN 6 */
+    /* User can add his own implementation to report the file name and line number,
+       ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+    /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
 </file>
 
 <file path="MyCore/Src/DataStructConfig.cpp">
@@ -6743,6 +7311,745 @@ void I2CBus::irq_handler()
     xSemaphoreGiveFromISR(lock, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
+</file>
+
+<file path="MyDrone.ioc">
+#MicroXplorer Configuration settings - do not modify
+CAD.formats=
+CAD.pinconfig=
+CAD.provider=
+CORTEX_M7.CPU_DCache=Enabled
+CORTEX_M7.CPU_ICache=Enabled
+CORTEX_M7.IPParameters=default_mode_Activation,CPU_ICache,CPU_DCache
+CORTEX_M7.default_mode_Activation=1
+Dma.I2C1_RX.6.Direction=DMA_PERIPH_TO_MEMORY
+Dma.I2C1_RX.6.EventEnable=DISABLE
+Dma.I2C1_RX.6.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.I2C1_RX.6.Instance=DMA1_Stream0
+Dma.I2C1_RX.6.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.I2C1_RX.6.MemInc=DMA_MINC_ENABLE
+Dma.I2C1_RX.6.Mode=DMA_NORMAL
+Dma.I2C1_RX.6.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.I2C1_RX.6.PeriphInc=DMA_PINC_DISABLE
+Dma.I2C1_RX.6.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.I2C1_RX.6.Priority=DMA_PRIORITY_LOW
+Dma.I2C1_RX.6.RequestNumber=1
+Dma.I2C1_RX.6.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.I2C1_RX.6.SignalID=NONE
+Dma.I2C1_RX.6.SyncEnable=DISABLE
+Dma.I2C1_RX.6.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.I2C1_RX.6.SyncRequestNumber=1
+Dma.I2C1_RX.6.SyncSignalID=NONE
+Dma.I2C1_TX.7.Direction=DMA_MEMORY_TO_PERIPH
+Dma.I2C1_TX.7.EventEnable=DISABLE
+Dma.I2C1_TX.7.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.I2C1_TX.7.Instance=DMA1_Stream7
+Dma.I2C1_TX.7.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.I2C1_TX.7.MemInc=DMA_MINC_ENABLE
+Dma.I2C1_TX.7.Mode=DMA_NORMAL
+Dma.I2C1_TX.7.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.I2C1_TX.7.PeriphInc=DMA_PINC_DISABLE
+Dma.I2C1_TX.7.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.I2C1_TX.7.Priority=DMA_PRIORITY_LOW
+Dma.I2C1_TX.7.RequestNumber=1
+Dma.I2C1_TX.7.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.I2C1_TX.7.SignalID=NONE
+Dma.I2C1_TX.7.SyncEnable=DISABLE
+Dma.I2C1_TX.7.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.I2C1_TX.7.SyncRequestNumber=1
+Dma.I2C1_TX.7.SyncSignalID=NONE
+Dma.Request0=SPI1_RX
+Dma.Request1=SPI1_TX
+Dma.Request2=SPI2_RX
+Dma.Request3=SPI2_TX
+Dma.Request4=SPI3_RX
+Dma.Request5=SPI3_TX
+Dma.Request6=I2C1_RX
+Dma.Request7=I2C1_TX
+Dma.Request8=SPI4_RX
+Dma.Request9=SPI4_TX
+Dma.RequestsNb=10
+Dma.SPI1_RX.0.Direction=DMA_PERIPH_TO_MEMORY
+Dma.SPI1_RX.0.EventEnable=DISABLE
+Dma.SPI1_RX.0.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI1_RX.0.Instance=DMA1_Stream1
+Dma.SPI1_RX.0.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI1_RX.0.MemInc=DMA_MINC_ENABLE
+Dma.SPI1_RX.0.Mode=DMA_NORMAL
+Dma.SPI1_RX.0.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI1_RX.0.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI1_RX.0.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI1_RX.0.Priority=DMA_PRIORITY_LOW
+Dma.SPI1_RX.0.RequestNumber=1
+Dma.SPI1_RX.0.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI1_RX.0.SignalID=NONE
+Dma.SPI1_RX.0.SyncEnable=DISABLE
+Dma.SPI1_RX.0.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI1_RX.0.SyncRequestNumber=1
+Dma.SPI1_RX.0.SyncSignalID=NONE
+Dma.SPI1_TX.1.Direction=DMA_MEMORY_TO_PERIPH
+Dma.SPI1_TX.1.EventEnable=DISABLE
+Dma.SPI1_TX.1.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI1_TX.1.Instance=DMA1_Stream2
+Dma.SPI1_TX.1.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI1_TX.1.MemInc=DMA_MINC_ENABLE
+Dma.SPI1_TX.1.Mode=DMA_NORMAL
+Dma.SPI1_TX.1.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI1_TX.1.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI1_TX.1.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI1_TX.1.Priority=DMA_PRIORITY_LOW
+Dma.SPI1_TX.1.RequestNumber=1
+Dma.SPI1_TX.1.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI1_TX.1.SignalID=NONE
+Dma.SPI1_TX.1.SyncEnable=DISABLE
+Dma.SPI1_TX.1.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI1_TX.1.SyncRequestNumber=1
+Dma.SPI1_TX.1.SyncSignalID=NONE
+Dma.SPI2_RX.2.Direction=DMA_PERIPH_TO_MEMORY
+Dma.SPI2_RX.2.EventEnable=DISABLE
+Dma.SPI2_RX.2.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI2_RX.2.Instance=DMA1_Stream3
+Dma.SPI2_RX.2.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI2_RX.2.MemInc=DMA_MINC_ENABLE
+Dma.SPI2_RX.2.Mode=DMA_NORMAL
+Dma.SPI2_RX.2.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI2_RX.2.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI2_RX.2.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI2_RX.2.Priority=DMA_PRIORITY_LOW
+Dma.SPI2_RX.2.RequestNumber=1
+Dma.SPI2_RX.2.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI2_RX.2.SignalID=NONE
+Dma.SPI2_RX.2.SyncEnable=DISABLE
+Dma.SPI2_RX.2.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI2_RX.2.SyncRequestNumber=1
+Dma.SPI2_RX.2.SyncSignalID=NONE
+Dma.SPI2_TX.3.Direction=DMA_MEMORY_TO_PERIPH
+Dma.SPI2_TX.3.EventEnable=DISABLE
+Dma.SPI2_TX.3.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI2_TX.3.Instance=DMA1_Stream4
+Dma.SPI2_TX.3.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI2_TX.3.MemInc=DMA_MINC_ENABLE
+Dma.SPI2_TX.3.Mode=DMA_NORMAL
+Dma.SPI2_TX.3.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI2_TX.3.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI2_TX.3.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI2_TX.3.Priority=DMA_PRIORITY_LOW
+Dma.SPI2_TX.3.RequestNumber=1
+Dma.SPI2_TX.3.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI2_TX.3.SignalID=NONE
+Dma.SPI2_TX.3.SyncEnable=DISABLE
+Dma.SPI2_TX.3.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI2_TX.3.SyncRequestNumber=1
+Dma.SPI2_TX.3.SyncSignalID=NONE
+Dma.SPI3_RX.4.Direction=DMA_PERIPH_TO_MEMORY
+Dma.SPI3_RX.4.EventEnable=DISABLE
+Dma.SPI3_RX.4.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI3_RX.4.Instance=DMA1_Stream5
+Dma.SPI3_RX.4.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI3_RX.4.MemInc=DMA_MINC_ENABLE
+Dma.SPI3_RX.4.Mode=DMA_NORMAL
+Dma.SPI3_RX.4.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI3_RX.4.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI3_RX.4.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI3_RX.4.Priority=DMA_PRIORITY_LOW
+Dma.SPI3_RX.4.RequestNumber=1
+Dma.SPI3_RX.4.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI3_RX.4.SignalID=NONE
+Dma.SPI3_RX.4.SyncEnable=DISABLE
+Dma.SPI3_RX.4.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI3_RX.4.SyncRequestNumber=1
+Dma.SPI3_RX.4.SyncSignalID=NONE
+Dma.SPI3_TX.5.Direction=DMA_MEMORY_TO_PERIPH
+Dma.SPI3_TX.5.EventEnable=DISABLE
+Dma.SPI3_TX.5.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI3_TX.5.Instance=DMA1_Stream6
+Dma.SPI3_TX.5.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI3_TX.5.MemInc=DMA_MINC_ENABLE
+Dma.SPI3_TX.5.Mode=DMA_NORMAL
+Dma.SPI3_TX.5.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI3_TX.5.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI3_TX.5.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI3_TX.5.Priority=DMA_PRIORITY_LOW
+Dma.SPI3_TX.5.RequestNumber=1
+Dma.SPI3_TX.5.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI3_TX.5.SignalID=NONE
+Dma.SPI3_TX.5.SyncEnable=DISABLE
+Dma.SPI3_TX.5.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI3_TX.5.SyncRequestNumber=1
+Dma.SPI3_TX.5.SyncSignalID=NONE
+Dma.SPI4_RX.8.Direction=DMA_PERIPH_TO_MEMORY
+Dma.SPI4_RX.8.EventEnable=DISABLE
+Dma.SPI4_RX.8.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI4_RX.8.Instance=DMA2_Stream0
+Dma.SPI4_RX.8.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI4_RX.8.MemInc=DMA_MINC_ENABLE
+Dma.SPI4_RX.8.Mode=DMA_NORMAL
+Dma.SPI4_RX.8.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI4_RX.8.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI4_RX.8.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI4_RX.8.Priority=DMA_PRIORITY_HIGH
+Dma.SPI4_RX.8.RequestNumber=1
+Dma.SPI4_RX.8.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI4_RX.8.SignalID=NONE
+Dma.SPI4_RX.8.SyncEnable=DISABLE
+Dma.SPI4_RX.8.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI4_RX.8.SyncRequestNumber=1
+Dma.SPI4_RX.8.SyncSignalID=NONE
+Dma.SPI4_TX.9.Direction=DMA_MEMORY_TO_PERIPH
+Dma.SPI4_TX.9.EventEnable=DISABLE
+Dma.SPI4_TX.9.FIFOMode=DMA_FIFOMODE_DISABLE
+Dma.SPI4_TX.9.Instance=DMA2_Stream1
+Dma.SPI4_TX.9.MemDataAlignment=DMA_MDATAALIGN_BYTE
+Dma.SPI4_TX.9.MemInc=DMA_MINC_ENABLE
+Dma.SPI4_TX.9.Mode=DMA_NORMAL
+Dma.SPI4_TX.9.PeriphDataAlignment=DMA_PDATAALIGN_BYTE
+Dma.SPI4_TX.9.PeriphInc=DMA_PINC_DISABLE
+Dma.SPI4_TX.9.Polarity=HAL_DMAMUX_REQ_GEN_RISING
+Dma.SPI4_TX.9.Priority=DMA_PRIORITY_HIGH
+Dma.SPI4_TX.9.RequestNumber=1
+Dma.SPI4_TX.9.RequestParameters=Instance,Direction,PeriphInc,MemInc,PeriphDataAlignment,MemDataAlignment,Mode,Priority,FIFOMode,SignalID,Polarity,RequestNumber,SyncSignalID,SyncPolarity,SyncEnable,EventEnable,SyncRequestNumber
+Dma.SPI4_TX.9.SignalID=NONE
+Dma.SPI4_TX.9.SyncEnable=DISABLE
+Dma.SPI4_TX.9.SyncPolarity=HAL_DMAMUX_SYNC_NO_EVENT
+Dma.SPI4_TX.9.SyncRequestNumber=1
+Dma.SPI4_TX.9.SyncSignalID=NONE
+FREERTOS.HEAP_NUMBER=4
+FREERTOS.IPParameters=Tasks01,configENABLE_FPU,configTOTAL_HEAP_SIZE,configCHECK_FOR_STACK_OVERFLOW,configTIMER_TASK_PRIORITY,HEAP_NUMBER
+FREERTOS.Tasks01=defaultTask,24,128,StartDefaultTask,Default,NULL,Dynamic,NULL,NULL
+FREERTOS.configCHECK_FOR_STACK_OVERFLOW=2
+FREERTOS.configENABLE_FPU=1
+FREERTOS.configTIMER_TASK_PRIORITY=40
+FREERTOS.configTOTAL_HEAP_SIZE=131072
+File.Version=6
+GPIO.groupedBy=Show All
+I2C1.IPParameters=Timing
+I2C1.Timing=0x307075B1
+KeepUserPlacement=false
+MMTAppRegionsCount=0
+MMTConfigApplied=false
+MMTSectionSuffix=
+Mcu.CPN=STM32H743VIT6
+Mcu.Family=STM32H7
+Mcu.IP0=CORTEX_M7
+Mcu.IP1=DEBUG
+Mcu.IP10=SPI3
+Mcu.IP11=SPI4
+Mcu.IP12=SYS
+Mcu.IP13=TIM2
+Mcu.IP14=TIM4
+Mcu.IP2=DMA
+Mcu.IP3=FREERTOS
+Mcu.IP4=I2C1
+Mcu.IP5=MEMORYMAP
+Mcu.IP6=NVIC
+Mcu.IP7=RCC
+Mcu.IP8=SPI1
+Mcu.IP9=SPI2
+Mcu.IPNb=15
+Mcu.Name=STM32H743VITx
+Mcu.Package=LQFP100
+Mcu.Pin0=PE2
+Mcu.Pin1=PE3
+Mcu.Pin10=PA3
+Mcu.Pin11=PA4
+Mcu.Pin12=PA5
+Mcu.Pin13=PA6
+Mcu.Pin14=PA7
+Mcu.Pin15=PE11
+Mcu.Pin16=PB12
+Mcu.Pin17=PB13
+Mcu.Pin18=PB14
+Mcu.Pin19=PB15
+Mcu.Pin2=PE4
+Mcu.Pin20=PD12
+Mcu.Pin21=PD13
+Mcu.Pin22=PD14
+Mcu.Pin23=PC8
+Mcu.Pin24=PA13 (JTMS/SWDIO)
+Mcu.Pin25=PA14 (JTCK/SWCLK)
+Mcu.Pin26=PA15 (JTDI)
+Mcu.Pin27=PC10
+Mcu.Pin28=PC11
+Mcu.Pin29=PC12
+Mcu.Pin3=PE5
+Mcu.Pin30=PD2
+Mcu.Pin31=PB4 (NJTRST)
+Mcu.Pin32=PB5
+Mcu.Pin33=PB7
+Mcu.Pin34=PB8
+Mcu.Pin35=VP_FREERTOS_VS_CMSIS_V2
+Mcu.Pin36=VP_SYS_VS_tim7
+Mcu.Pin37=VP_MEMORYMAP_VS_MEMORYMAP
+Mcu.Pin4=PE6
+Mcu.Pin5=PH0-OSC_IN (PH0)
+Mcu.Pin6=PH1-OSC_OUT (PH1)
+Mcu.Pin7=PA0
+Mcu.Pin8=PA1
+Mcu.Pin9=PA2
+Mcu.PinsNb=38
+Mcu.ThirdPartyNb=0
+Mcu.UserConstants=
+Mcu.UserName=STM32H743VITx
+MxCube.Version=6.16.1
+MxDb.Version=DB.6.0.161
+NVIC.BusFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+NVIC.DMA1_Stream0_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream1_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream2_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream3_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream4_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream5_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream6_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA1_Stream7_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA2_Stream0_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DMA2_Stream1_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.DebugMonitor_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+NVIC.EXTI9_5_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
+NVIC.ForceEnableDMAVector=true
+NVIC.HardFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+NVIC.I2C1_ER_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
+NVIC.I2C1_EV_IRQn=true\:5\:0\:false\:false\:true\:true\:true\:true\:true
+NVIC.MemoryManagement_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+NVIC.NonMaskableInt_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+NVIC.PendSV_IRQn=true\:15\:0\:false\:false\:false\:true\:false\:false\:false
+NVIC.PriorityGroup=NVIC_PRIORITYGROUP_4
+NVIC.SPI1_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.SPI2_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.SPI3_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.SPI4_IRQn=true\:5\:0\:false\:false\:true\:true\:false\:true\:true
+NVIC.SVCall_IRQn=true\:0\:0\:false\:false\:false\:false\:false\:false\:false
+NVIC.SavedPendsvIrqHandlerGenerated=true
+NVIC.SavedSvcallIrqHandlerGenerated=true
+NVIC.SavedSystickIrqHandlerGenerated=true
+NVIC.SysTick_IRQn=true\:15\:0\:false\:false\:false\:true\:false\:true\:false
+NVIC.TIM7_IRQn=true\:15\:0\:true\:false\:true\:false\:false\:true\:true
+NVIC.TimeBase=TIM7_IRQn
+NVIC.TimeBaseIP=TIM7
+NVIC.UsageFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false\:false
+PA0.Locked=true
+PA0.Signal=S_TIM2_CH1_ETR
+PA1.Signal=S_TIM2_CH2
+PA13\ (JTMS/SWDIO).Mode=Serial_Wire
+PA13\ (JTMS/SWDIO).Signal=DEBUG_JTMS-SWDIO
+PA14\ (JTCK/SWCLK).Mode=Serial_Wire
+PA14\ (JTCK/SWCLK).Signal=DEBUG_JTCK-SWCLK
+PA15\ (JTDI).GPIOParameters=GPIO_Label
+PA15\ (JTDI).GPIO_Label=PMW3901GND
+PA15\ (JTDI).Locked=true
+PA15\ (JTDI).Signal=GPIO_Output
+PA2.GPIOParameters=PinState,GPIO_Label
+PA2.GPIO_Label=DPS310VCC
+PA2.Locked=true
+PA2.PinState=GPIO_PIN_SET
+PA2.Signal=GPIO_Output
+PA3.GPIOParameters=GPIO_Label
+PA3.GPIO_Label=DPS310GND
+PA3.Locked=true
+PA3.Signal=GPIO_Output
+PA4.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
+PA4.GPIO_Label=DPS310_NCS
+PA4.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PA4.Locked=true
+PA4.PinState=GPIO_PIN_SET
+PA4.Signal=GPIO_Output
+PA5.GPIOParameters=GPIO_Label
+PA5.GPIO_Label=DPS310
+PA5.Mode=Full_Duplex_Master
+PA5.Signal=SPI1_SCK
+PA6.Mode=Full_Duplex_Master
+PA6.Signal=SPI1_MISO
+PA7.Mode=Full_Duplex_Master
+PA7.Signal=SPI1_MOSI
+PB12.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
+PB12.GPIO_Label=PMW3901_NCS
+PB12.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PB12.Locked=true
+PB12.PinState=GPIO_PIN_SET
+PB12.Signal=GPIO_Output
+PB13.GPIOParameters=GPIO_Label
+PB13.GPIO_Label=PMW3901
+PB13.Locked=true
+PB13.Mode=Full_Duplex_Master
+PB13.Signal=SPI2_SCK
+PB14.Locked=true
+PB14.Mode=Full_Duplex_Master
+PB14.Signal=SPI2_MISO
+PB15.Locked=true
+PB15.Mode=Full_Duplex_Master
+PB15.Signal=SPI2_MOSI
+PB4\ (NJTRST).GPIOParameters=PinState,GPIO_Label
+PB4\ (NJTRST).GPIO_Label=MMC5983VCC
+PB4\ (NJTRST).Locked=true
+PB4\ (NJTRST).PinState=GPIO_PIN_SET
+PB4\ (NJTRST).Signal=GPIO_Output
+PB5.GPIOParameters=GPIO_Label
+PB5.GPIO_Label=MMC5983GND
+PB5.Locked=true
+PB5.Signal=GPIO_Output
+PB7.GPIOParameters=GPIO_Speed
+PB7.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PB7.Mode=I2C
+PB7.Signal=I2C1_SDA
+PB8.GPIOParameters=GPIO_Speed
+PB8.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PB8.Locked=true
+PB8.Mode=I2C
+PB8.Signal=I2C1_SCL
+PC10.GPIOParameters=GPIO_Label
+PC10.GPIO_Label=ICM42688
+PC10.Mode=Full_Duplex_Master
+PC10.Signal=SPI3_SCK
+PC11.Mode=Full_Duplex_Master
+PC11.Signal=SPI3_MISO
+PC12.Locked=true
+PC12.Mode=Full_Duplex_Master
+PC12.Signal=SPI3_MOSI
+PC8.GPIOParameters=GPIO_Label
+PC8.GPIO_Label=ICM42688INT
+PC8.Locked=true
+PC8.Signal=GPXTI8
+PD12.Signal=S_TIM4_CH1
+PD13.Signal=S_TIM4_CH2
+PD14.GPIOParameters=PinState,GPIO_Label
+PD14.GPIO_Label=PMW3901VCC
+PD14.Locked=true
+PD14.PinState=GPIO_PIN_SET
+PD14.Signal=GPIO_Output
+PD2.GPIOParameters=GPIO_Speed,PinState,GPIO_Label
+PD2.GPIO_Label=ICM42688_NCS
+PD2.GPIO_Speed=GPIO_SPEED_FREQ_VERY_HIGH
+PD2.Locked=true
+PD2.PinState=GPIO_PIN_SET
+PD2.Signal=GPIO_Output
+PE11.Mode=NSS_Signal_Hard_Input
+PE11.Signal=SPI4_NSS
+PE2.Mode=Full_Duplex_Slave
+PE2.Signal=SPI4_SCK
+PE3.GPIOParameters=GPIO_Label
+PE3.GPIO_Label=ICM42688GND
+PE3.Locked=true
+PE3.Signal=GPIO_Output
+PE4.GPIOParameters=PinState,GPIO_Label
+PE4.GPIO_Label=ICM42688VCC
+PE4.Locked=true
+PE4.PinState=GPIO_PIN_SET
+PE4.Signal=GPIO_Output
+PE5.Mode=Full_Duplex_Slave
+PE5.Signal=SPI4_MISO
+PE6.Mode=Full_Duplex_Slave
+PE6.Signal=SPI4_MOSI
+PH0-OSC_IN\ (PH0).Mode=HSE-External-Oscillator
+PH0-OSC_IN\ (PH0).Signal=RCC_OSC_IN
+PH1-OSC_OUT\ (PH1).Mode=HSE-External-Oscillator
+PH1-OSC_OUT\ (PH1).Signal=RCC_OSC_OUT
+PinOutPanel.RotationAngle=0
+ProjectManager.AskForMigrate=true
+ProjectManager.BackupPrevious=false
+ProjectManager.CompilerLinker=GCC
+ProjectManager.CompilerOptimize=6
+ProjectManager.ComputerToolchain=false
+ProjectManager.CoupleFile=true
+ProjectManager.CustomerFirmwarePackage=
+ProjectManager.DefaultFWLocation=true
+ProjectManager.DeletePrevious=true
+ProjectManager.DeviceId=STM32H743VITx
+ProjectManager.FirmwarePackage=STM32Cube FW_H7 V1.12.1
+ProjectManager.FreePins=false
+ProjectManager.FreePinsContext=
+ProjectManager.HalAssertFull=false
+ProjectManager.HeapSize=0x200
+ProjectManager.KeepUserCode=true
+ProjectManager.LastFirmware=true
+ProjectManager.LibraryCopy=1
+ProjectManager.MainLocation=Core/Src
+ProjectManager.NoMain=false
+ProjectManager.PreviousToolchain=STM32CubeIDE
+ProjectManager.ProjectBuild=false
+ProjectManager.ProjectFileName=MyDrone.ioc
+ProjectManager.ProjectName=MyDrone
+ProjectManager.ProjectStructure=
+ProjectManager.RegisterCallBack=
+ProjectManager.StackSize=0x400
+ProjectManager.TargetToolchain=STM32CubeIDE
+ProjectManager.ToolChainLocation=
+ProjectManager.UAScriptAfterPath=
+ProjectManager.UAScriptBeforePath=
+ProjectManager.UnderRoot=true
+ProjectManager.functionlistsort=1-SystemClock_Config-RCC-false-HAL-false,2-MX_GPIO_Init-GPIO-false-HAL-true,3-MX_DMA_Init-DMA-false-HAL-true,4-MX_SPI1_Init-SPI1-false-HAL-true,5-MX_SPI2_Init-SPI2-false-HAL-true,6-MX_SPI3_Init-SPI3-false-HAL-true,7-MX_TIM2_Init-TIM2-false-HAL-true,8-MX_TIM4_Init-TIM4-false-HAL-true,9-MX_I2C1_Init-I2C1-false-HAL-true,10-MX_SPI4_Init-SPI4-false-HAL-true,0-MX_CORTEX_M7_Init-CORTEX_M7-false-HAL-true
+RCC.ADCFreq_Value=50390625
+RCC.AHB12Freq_Value=240000000
+RCC.AHB4Freq_Value=240000000
+RCC.APB1Freq_Value=120000000
+RCC.APB2Freq_Value=120000000
+RCC.APB3Freq_Value=120000000
+RCC.APB4Freq_Value=120000000
+RCC.AXIClockFreq_Value=240000000
+RCC.CECFreq_Value=32000
+RCC.CKPERFreq_Value=64000000
+RCC.CortexFreq_Value=480000000
+RCC.CpuClockFreq_Value=480000000
+RCC.D1CPREFreq_Value=480000000
+RCC.D1PPRE=RCC_APB3_DIV2
+RCC.D2PPRE1=RCC_APB1_DIV2
+RCC.D2PPRE2=RCC_APB2_DIV2
+RCC.D3PPRE=RCC_APB4_DIV2
+RCC.DFSDMACLkFreq_Value=192000000
+RCC.DFSDMFreq_Value=120000000
+RCC.DIVM1=5
+RCC.DIVN1=192
+RCC.DIVP1Freq_Value=480000000
+RCC.DIVP2Freq_Value=50390625
+RCC.DIVP3Freq_Value=50390625
+RCC.DIVQ1=5
+RCC.DIVQ1Freq_Value=192000000
+RCC.DIVQ2Freq_Value=50390625
+RCC.DIVQ3Freq_Value=50390625
+RCC.DIVR1Freq_Value=480000000
+RCC.DIVR2Freq_Value=50390625
+RCC.DIVR3Freq_Value=50390625
+RCC.FDCANFreq_Value=192000000
+RCC.FMCFreq_Value=240000000
+RCC.FamilyName=M
+RCC.HCLK3ClockFreq_Value=240000000
+RCC.HCLKFreq_Value=240000000
+RCC.HPRE=RCC_HCLK_DIV2
+RCC.HRTIMFreq_Value=240000000
+RCC.I2C123Freq_Value=120000000
+RCC.I2C4Freq_Value=120000000
+RCC.IPParameters=ADCFreq_Value,AHB12Freq_Value,AHB4Freq_Value,APB1Freq_Value,APB2Freq_Value,APB3Freq_Value,APB4Freq_Value,AXIClockFreq_Value,CECFreq_Value,CKPERFreq_Value,CortexFreq_Value,CpuClockFreq_Value,D1CPREFreq_Value,D1PPRE,D2PPRE1,D2PPRE2,D3PPRE,DFSDMACLkFreq_Value,DFSDMFreq_Value,DIVM1,DIVN1,DIVP1Freq_Value,DIVP2Freq_Value,DIVP3Freq_Value,DIVQ1,DIVQ1Freq_Value,DIVQ2Freq_Value,DIVQ3Freq_Value,DIVR1Freq_Value,DIVR2Freq_Value,DIVR3Freq_Value,FDCANFreq_Value,FMCFreq_Value,FamilyName,HCLK3ClockFreq_Value,HCLKFreq_Value,HPRE,HRTIMFreq_Value,I2C123Freq_Value,I2C4Freq_Value,LPTIM1Freq_Value,LPTIM2Freq_Value,LPTIM345Freq_Value,LPUART1Freq_Value,LTDCFreq_Value,MCO1PinFreq_Value,MCO2PinFreq_Value,PLLFRACN,PLLSourceVirtual,PWR_Regulator_Voltage_Scale,QSPIFreq_Value,RNGFreq_Value,RTCFreq_Value,SAI1Freq_Value,SAI23Freq_Value,SAI4AFreq_Value,SAI4BFreq_Value,SDMMCFreq_Value,SPDIFRXFreq_Value,SPI123Freq_Value,SPI45Freq_Value,SPI6Freq_Value,SWPMI1Freq_Value,SYSCLKFreq_VALUE,SYSCLKSource,Tim1OutputFreq_Value,Tim2OutputFreq_Value,TraceFreq_Value,USART16Freq_Value,USART234578Freq_Value,USBFreq_Value,VCO1OutputFreq_Value,VCO2OutputFreq_Value,VCO3OutputFreq_Value,VCOInput1Freq_Value,VCOInput2Freq_Value,VCOInput3Freq_Value
+RCC.LPTIM1Freq_Value=120000000
+RCC.LPTIM2Freq_Value=120000000
+RCC.LPTIM345Freq_Value=120000000
+RCC.LPUART1Freq_Value=120000000
+RCC.LTDCFreq_Value=50390625
+RCC.MCO1PinFreq_Value=64000000
+RCC.MCO2PinFreq_Value=480000000
+RCC.PLLFRACN=0
+RCC.PLLSourceVirtual=RCC_PLLSOURCE_HSE
+RCC.PWR_Regulator_Voltage_Scale=PWR_REGULATOR_VOLTAGE_SCALE0
+RCC.QSPIFreq_Value=240000000
+RCC.RNGFreq_Value=48000000
+RCC.RTCFreq_Value=32000
+RCC.SAI1Freq_Value=192000000
+RCC.SAI23Freq_Value=192000000
+RCC.SAI4AFreq_Value=192000000
+RCC.SAI4BFreq_Value=192000000
+RCC.SDMMCFreq_Value=192000000
+RCC.SPDIFRXFreq_Value=192000000
+RCC.SPI123Freq_Value=192000000
+RCC.SPI45Freq_Value=120000000
+RCC.SPI6Freq_Value=120000000
+RCC.SWPMI1Freq_Value=120000000
+RCC.SYSCLKFreq_VALUE=480000000
+RCC.SYSCLKSource=RCC_SYSCLKSOURCE_PLLCLK
+RCC.Tim1OutputFreq_Value=240000000
+RCC.Tim2OutputFreq_Value=240000000
+RCC.TraceFreq_Value=480000000
+RCC.USART16Freq_Value=120000000
+RCC.USART234578Freq_Value=120000000
+RCC.USBFreq_Value=192000000
+RCC.VCO1OutputFreq_Value=960000000
+RCC.VCO2OutputFreq_Value=100781250
+RCC.VCO3OutputFreq_Value=100781250
+RCC.VCOInput1Freq_Value=5000000
+RCC.VCOInput2Freq_Value=781250
+RCC.VCOInput3Freq_Value=781250
+SH.GPXTI8.0=GPIO_EXTI8
+SH.GPXTI8.ConfNb=1
+SH.S_TIM2_CH1_ETR.0=TIM2_CH1,PWM Generation1 CH1
+SH.S_TIM2_CH1_ETR.ConfNb=1
+SH.S_TIM2_CH2.0=TIM2_CH2,PWM Generation2 CH2
+SH.S_TIM2_CH2.ConfNb=1
+SH.S_TIM4_CH1.0=TIM4_CH1,PWM Generation1 CH1
+SH.S_TIM4_CH1.ConfNb=1
+SH.S_TIM4_CH2.0=TIM4_CH2,PWM Generation2 CH2
+SH.S_TIM4_CH2.ConfNb=1
+SPI1.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_32
+SPI1.CLKPhase=SPI_PHASE_2EDGE
+SPI1.CLKPolarity=SPI_POLARITY_HIGH
+SPI1.CalculateBaudRate=6.0 MBits/s
+SPI1.DataSize=SPI_DATASIZE_8BIT
+SPI1.Direction=SPI_DIRECTION_2LINES
+SPI1.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,CLKPolarity,CLKPhase,DataSize
+SPI1.Mode=SPI_MODE_MASTER
+SPI1.VirtualType=VM_MASTER
+SPI2.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_128
+SPI2.CLKPhase=SPI_PHASE_2EDGE
+SPI2.CLKPolarity=SPI_POLARITY_HIGH
+SPI2.CalculateBaudRate=1.5 MBits/s
+SPI2.DataSize=SPI_DATASIZE_8BIT
+SPI2.Direction=SPI_DIRECTION_2LINES
+SPI2.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,DataSize,CLKPolarity,CLKPhase
+SPI2.Mode=SPI_MODE_MASTER
+SPI2.VirtualType=VM_MASTER
+SPI3.BaudRatePrescaler=SPI_BAUDRATEPRESCALER_16
+SPI3.CLKPhase=SPI_PHASE_2EDGE
+SPI3.CLKPolarity=SPI_POLARITY_HIGH
+SPI3.CalculateBaudRate=12.0 MBits/s
+SPI3.DataSize=SPI_DATASIZE_8BIT
+SPI3.Direction=SPI_DIRECTION_2LINES
+SPI3.IPParameters=VirtualType,Mode,Direction,BaudRatePrescaler,CalculateBaudRate,DataSize,CLKPolarity,CLKPhase
+SPI3.Mode=SPI_MODE_MASTER
+SPI3.VirtualType=VM_MASTER
+SPI4.DataSize=SPI_DATASIZE_8BIT
+SPI4.Direction=SPI_DIRECTION_2LINES
+SPI4.IPParameters=VirtualType,Mode,Direction,DataSize,VirtualNSS
+SPI4.Mode=SPI_MODE_SLAVE
+SPI4.VirtualNSS=VM_NSSHARD
+SPI4.VirtualType=VM_SLAVE
+TIM2.Channel-PWM\ Generation1\ CH1=TIM_CHANNEL_1
+TIM2.Channel-PWM\ Generation2\ CH2=TIM_CHANNEL_2
+TIM2.IPParameters=Channel-PWM Generation1 CH1,Channel-PWM Generation2 CH2,Prescaler,Period,Pulse-PWM Generation1 CH1,Pulse-PWM Generation2 CH2
+TIM2.Period=20000
+TIM2.Prescaler=240-1
+TIM2.Pulse-PWM\ Generation1\ CH1=1500
+TIM2.Pulse-PWM\ Generation2\ CH2=1500
+TIM4.Channel-PWM\ Generation1\ CH1=TIM_CHANNEL_1
+TIM4.Channel-PWM\ Generation2\ CH2=TIM_CHANNEL_2
+TIM4.IPParameters=Channel-PWM Generation1 CH1,Channel-PWM Generation2 CH2,Prescaler,Period,Pulse-PWM Generation1 CH1,Pulse-PWM Generation2 CH2
+TIM4.Period=20000
+TIM4.Prescaler=240-1
+TIM4.Pulse-PWM\ Generation1\ CH1=1500
+TIM4.Pulse-PWM\ Generation2\ CH2=1500
+VP_FREERTOS_VS_CMSIS_V2.Mode=CMSIS_V2
+VP_FREERTOS_VS_CMSIS_V2.Signal=FREERTOS_VS_CMSIS_V2
+VP_MEMORYMAP_VS_MEMORYMAP.Mode=CurAppReg
+VP_MEMORYMAP_VS_MEMORYMAP.Signal=MEMORYMAP_VS_MEMORYMAP
+VP_SYS_VS_tim7.Mode=TIM7
+VP_SYS_VS_tim7.Signal=SYS_VS_tim7
+board=custom
+rtos.0.ip=FREERTOS
+</file>
+
+<file path="MyCore/Inc/TaskConfig.hpp">
+#pragma once
+#include "main.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void Bridge_SystemSensors_Init(void); //
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "spi.h"
+#include "i2c.h"
+#include "QueueConfig.hpp"
+#include "Sensors.hpp"
+#include "DataStructConfig.hpp"
+#include "Mydelay.hpp"
+#define ICM42688_Buffer_Length 32
+#define MMC5983_Buffer_Length  32
+#define DPS310_Buffer_Length   32
+#define PMW3901_Buffer_Length  32
+
+extern SPIBus spi1_bus;
+extern SPIBus spi2_bus;
+extern SPIBus spi3_bus;
+extern I2CBus i2c1_bus;
+
+extern AXI_SRAM uint8_t ICM42688RxBuffer[ICM42688_Buffer_Length];
+extern AXI_SRAM uint8_t ICM42688TxBuffer[ICM42688_Buffer_Length];
+extern AXI_SRAM uint8_t MMC5983RxBuffer[MMC5983_Buffer_Length];
+extern AXI_SRAM uint8_t MMC5983TxBuffer[MMC5983_Buffer_Length];
+extern AXI_SRAM uint8_t DPS310RxBuffer[DPS310_Buffer_Length];
+extern AXI_SRAM uint8_t DPS310TxBuffer[DPS310_Buffer_Length];
+extern AXI_SRAM uint8_t PMW3901RxBuffer[PMW3901_Buffer_Length];
+extern AXI_SRAM uint8_t PMW3901TxBuffer[PMW3901_Buffer_Length];
+
+extern ICM42688 icm42688_sensor;
+extern MMC5983 mmc5983_sensor;
+extern DPS310 dps310_sensor;
+extern PMW3901 pmw3901_sensor;
+
+extern TaskHandle_t ICM42688ReadTaskHandle;
+extern TaskHandle_t ICM42688ProcessTaskHandle;
+extern TaskHandle_t MMC5983ReadTaskHandle;
+extern TaskHandle_t MMC5983ProcessTaskHandle;
+extern TaskHandle_t DPS310ReadTaskHandle;
+extern TaskHandle_t DPS310ProcessTaskHandle;
+extern TaskHandle_t PMW3901ReadTaskHandle;
+extern TaskHandle_t PMW3901ProcessTaskHandle;
+
+void SystemSensors_Init();                     // 初始化函数，负责创建初始化任务
+void SystemSensors_Init_Entry(void *argument); // 初始化任务，负责对总线和传感器进行初始化并创建读取和数据处理任务,以及姿态解算和控制任务
+void DPS310ReadTaskEntry(void *argument);      // DPS310 读取任务入口函数
+void DPS310ProcessTaskEntry(void *argument);   // DPS310 数据处理任务入口函数
+void PMW3901ReadTaskEntry(void *argument);     // PMW3901 读取任务入口函数
+void PMW3901ProcessTaskEntry(void *argument);  // PMW3901 数据处理任务入口函数
+void ICM42688ReadTaskEntry(void *argument);    // ICM42688 读取任务入口函数
+void ICM42688ProcessTaskEntry(void *argument); // ICM42688 数据处理任务入口函数
+void MMC5983ReadTaskEntry(void *argument);     // MMC5983 读取任务入口函数
+void MMC5983ProcessTaskEntry(void *argument);  // MMC5983 数据处理任务入口函数
+
+#endif
+</file>
+
+<file path="MyCore/Src/Callback.cpp">
+#include "TaskConfig.hpp"
+#include "main.h"
+extern "C" {
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == &hspi1) {
+        spi1_bus.irq_handler();
+    } else if (hspi == &hspi2) {
+        spi2_bus.irq_handler();
+    } else if (hspi == &hspi3) {
+        spi3_bus.irq_handler();
+    }
+}
+
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c == &hi2c1) {
+        i2c1_bus.irq_handler();
+    }
+}
+
+void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c == &hi2c1) {
+        i2c1_bus.irq_handler();
+    }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_8) {
+        if (ICM42688ReadTaskHandle != NULL) {
+            BaseType_t xWoken = pdFALSE;
+            vTaskNotifyGiveFromISR(ICM42688ReadTaskHandle, &xWoken);
+            portYIELD_FROM_ISR(xWoken);
+        }
+    }
+}
+
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c == &hi2c1) {
+        i2c1_bus.irq_handler();
+    }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi == &hspi1) {
+        spi1_bus.irq_handler();
+    } else if (hspi == &hspi2) {
+        spi2_bus.irq_handler();
+    } else if (hspi == &hspi3) {
+        spi3_bus.irq_handler();
+    }
+}
+} // extern "C" 结束
 </file>
 
 <file path="MyCore/Src/Sensors.cpp">
@@ -7147,7 +8454,7 @@ bool MMC5983::read_mag()
 {
     if (!write_reg(MMC5983_REG_CTRL0, 0x01)) {
         return false;
-    }
+    }//触发单次测量
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -7238,6 +8545,18 @@ typedef struct {
         } MMC5983;
     } data;
 } Sensor_Packet_t;
+// --- 补充在 MyCore/Inc/DataStructConfig.hpp 尾部 ---
+
+// 飞控 15维 ESKF 解算输出状态 (供后续 PID 姿态与位置控制器使用)
+typedef struct {
+    uint64_t timestamp;
+    float roll, pitch, yaw; // 欧拉角 (rad 弧度)
+    float q[4];             // 四元数: w, x, y, z
+    float position[3];      // NED位置 (m): 北、东、下 (注意：向下为正)
+    float velocity[3];      // NED速度 (m/s): 北、东、下
+    float accel_bias[3];    // 实时收敛的加速度计零偏 (m/s^2)
+    float gyro_bias[3];     // 实时收敛的陀螺仪零偏 (rad/s)
+} VehicleState_t;
 
 struct DeviceConfig {
     union {
@@ -7332,140 +8651,10 @@ public:
 };
 </file>
 
-<file path="MyCore/Inc/TaskConfig.hpp">
-#pragma once
-#include "main.h"
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void Bridge_SystemSensors_Init(void); //
-
-#ifdef __cplusplus
-}
-#endif
-
-#ifdef __cplusplus
-
-#include "FreeRTOS.h"
-#include "task.h"
-#include "spi.h"
-#include "i2c.h"
-#include "QueueConfig.hpp"
-#include "Sensors.hpp"
-#include "DataStructConfig.hpp"
-#include "Mydelay.hpp"
-#define ICM42688_Buffer_Length 32
-#define MMC5983_Buffer_Length  32
-#define DPS310_Buffer_Length   32
-#define PMW3901_Buffer_Length  32
-
-extern SPIBus spi1_bus;
-extern SPIBus spi2_bus;
-extern SPIBus spi3_bus;
-extern I2CBus i2c1_bus;
-
-extern AXI_SRAM uint8_t ICM42688RxBuffer[ICM42688_Buffer_Length];
-extern AXI_SRAM uint8_t ICM42688TxBuffer[ICM42688_Buffer_Length];
-extern AXI_SRAM uint8_t MMC5983RxBuffer[MMC5983_Buffer_Length];
-extern AXI_SRAM uint8_t MMC5983TxBuffer[MMC5983_Buffer_Length];
-extern AXI_SRAM uint8_t DPS310RxBuffer[DPS310_Buffer_Length];
-extern AXI_SRAM uint8_t DPS310TxBuffer[DPS310_Buffer_Length];
-extern AXI_SRAM uint8_t PMW3901RxBuffer[PMW3901_Buffer_Length];
-extern AXI_SRAM uint8_t PMW3901TxBuffer[PMW3901_Buffer_Length];
-
-extern ICM42688 icm42688_sensor;
-extern MMC5983 mmc5983_sensor;
-extern DPS310 dps310_sensor;
-extern PMW3901 pmw3901_sensor;
-
-extern TaskHandle_t ICM42688ReadTaskHandle;
-extern TaskHandle_t ICM42688ProcessTaskHandle;
-extern TaskHandle_t MMC5983ReadTaskHandle;
-extern TaskHandle_t MMC5983ProcessTaskHandle;
-extern TaskHandle_t DPS310ReadTaskHandle;
-extern TaskHandle_t DPS310ProcessTaskHandle;
-extern TaskHandle_t PMW3901ReadTaskHandle;
-extern TaskHandle_t PMW3901ProcessTaskHandle;
-
-void SystemSensors_Init();                     // 初始化函数，负责创建初始化任务
-void SystemSensors_Init_Entry(void *argument); // 初始化任务，负责对总线和传感器进行初始化并创建读取和数据处理任务,以及姿态解算和控制任务
-void DPS310ReadTaskEntry(void *argument);      // DPS310 读取任务入口函数
-void DPS310ProcessTaskEntry(void *argument);   // DPS310 数据处理任务入口函数
-void PMW3901ReadTaskEntry(void *argument);     // PMW3901 读取任务入口函数
-void PMW3901ProcessTaskEntry(void *argument);  // PMW3901 数据处理任务入口函数
-void ICM42688ReadTaskEntry(void *argument);    // ICM42688 读取任务入口函数
-void ICM42688ProcessTaskEntry(void *argument); // ICM42688 数据处理任务入口函数
-void MMC5983ReadTaskEntry(void *argument);     // MMC5983 读取任务入口函数
-void MMC5983ProcessTaskEntry(void *argument);  // MMC5983 数据处理任务入口函数
-
-#endif
-</file>
-
-<file path="MyCore/Src/Callback.cpp">
-#include "TaskConfig.hpp"
-#include "main.h"
-extern "C" {
-
-void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
-{
-    if (hspi == &hspi1) {
-        spi1_bus.irq_handler();
-    } else if (hspi == &hspi2) {
-        spi2_bus.irq_handler();
-    } else if (hspi == &hspi3) {
-        spi3_bus.irq_handler();
-    }
-}
-
-void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c == &hi2c1) {
-        i2c1_bus.irq_handler();
-    }
-}
-
-void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c == &hi2c1) {
-        i2c1_bus.irq_handler();
-    }
-}
-
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == GPIO_PIN_8) {
-        if (ICM42688ReadTaskHandle != NULL) {
-            BaseType_t xWoken = pdFALSE;
-            vTaskNotifyGiveFromISR(ICM42688ReadTaskHandle, &xWoken);
-            portYIELD_FROM_ISR(xWoken);
-        }
-    }
-}
-
-void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
-{
-    if (hi2c == &hi2c1) {
-        i2c1_bus.irq_handler();
-    }
-}
-
-void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
-{
-    if (hspi == &hspi1) {
-        spi1_bus.irq_handler();
-    } else if (hspi == &hspi2) {
-        spi2_bus.irq_handler();
-    } else if (hspi == &hspi3) {
-        spi3_bus.irq_handler();
-    }
-}
-} // extern "C" 结束
-</file>
-
 <file path="MyCore/Src/TaskConfig.cpp">
 #include "TaskConfig.hpp"
 #include "DebugMonitor.hpp"
+#include "AttitudeESKF.hpp"
 SPIBus spi1_bus(&hspi1);
 SPIBus spi2_bus(&hspi2);
 SPIBus spi3_bus(&hspi3);
@@ -7508,35 +8697,35 @@ MMC5983 mmc5983_sensor(
     MMC5983RxBuffer,
     0x30);
 
-DTCM_DATA StackType_t ICM42688ReadTaskStack[1024];
+DTCM_DATA StackType_t ICM42688ReadTaskStack[128];
 DTCM_DATA StaticTask_t ICM42688ReadTaskTCB;
 TaskHandle_t ICM42688ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t ICM42688ProcessTaskStack[1024];
+DTCM_DATA StackType_t ICM42688ProcessTaskStack[128];
 DTCM_DATA StaticTask_t ICM42688ProcessTaskTCB;
 TaskHandle_t ICM42688ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t MMC5983ReadTaskStack[1024];
+DTCM_DATA StackType_t MMC5983ReadTaskStack[128];
 DTCM_DATA StaticTask_t MMC5983ReadTaskTCB;
 TaskHandle_t MMC5983ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t MMC5983ProcessTaskStack[1024];
+DTCM_DATA StackType_t MMC5983ProcessTaskStack[128];
 DTCM_DATA StaticTask_t MMC5983ProcessTaskTCB;
 TaskHandle_t MMC5983ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t DPS310ReadTaskStack[1024];
+DTCM_DATA StackType_t DPS310ReadTaskStack[128];
 DTCM_DATA StaticTask_t DPS310ReadTaskTCB;
 TaskHandle_t DPS310ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t DPS310ProcessTaskStack[1024];
+DTCM_DATA StackType_t DPS310ProcessTaskStack[128];
 DTCM_DATA StaticTask_t DPS310ProcessTaskTCB;
 TaskHandle_t DPS310ProcessTaskHandle = NULL;
 
-DTCM_DATA StackType_t PMW3901ReadTaskStack[1024];
+DTCM_DATA StackType_t PMW3901ReadTaskStack[128];
 DTCM_DATA StaticTask_t PMW3901ReadTaskTCB;
 TaskHandle_t PMW3901ReadTaskHandle = NULL;
 
-DTCM_DATA StackType_t PMW3901ProcessTaskStack[1024];
+DTCM_DATA StackType_t PMW3901ProcessTaskStack[128];
 DTCM_DATA StaticTask_t PMW3901ProcessTaskTCB;
 TaskHandle_t PMW3901ProcessTaskHandle = NULL;
 
@@ -7552,7 +8741,7 @@ void SystemSensors_Init()
     xTaskCreate(
         SystemSensors_Init_Entry,
         "SensorInit",
-        1024,
+        256,
         NULL,
         configMAX_PRIORITIES - 1,
         NULL);
@@ -7573,45 +8762,45 @@ void SystemSensors_Init_Entry(void *argument)
     mmc5983_sensor.init_regs();
 
     ICM42688ReadTaskHandle = xTaskCreateStatic(
-        ICM42688ReadTaskEntry, "ICM42688Read", 1024, NULL,
+        ICM42688ReadTaskEntry, "ICM42688Read", 128, NULL,
         configMAX_PRIORITIES - 2, // 读取最高
         ICM42688ReadTaskStack, &ICM42688ReadTaskTCB);
 
     ICM42688ProcessTaskHandle = xTaskCreateStatic(
-        ICM42688ProcessTaskEntry, "ICM42688Proc", 1024, NULL,
+        ICM42688ProcessTaskEntry, "ICM42688Proc", 128, NULL,
         configMAX_PRIORITIES - 3, // 解析紧随其后
         ICM42688ProcessTaskStack, &ICM42688ProcessTaskTCB);
 
     // --- 导航：PMW3901 光流 (较高优先级) ---
     PMW3901ReadTaskHandle = xTaskCreateStatic(
-        PMW3901ReadTaskEntry, "PMW3901Read", 1024, NULL,
+        PMW3901ReadTaskEntry, "PMW3901Read", 128, NULL,
         configMAX_PRIORITIES - 4,
         PMW3901ReadTaskStack, &PMW3901ReadTaskTCB);
 
     PMW3901ProcessTaskHandle = xTaskCreateStatic(
-        PMW3901ProcessTaskEntry, "PMW3901Proc", 1024, NULL,
+        PMW3901ProcessTaskEntry, "PMW3901Proc", 128, NULL,
         configMAX_PRIORITIES - 5,
         PMW3901ProcessTaskStack, &PMW3901ProcessTaskTCB);
 
     // --- 辅助：MMC5983 磁力计 (中等优先级) ---
     MMC5983ReadTaskHandle = xTaskCreateStatic(
-        MMC5983ReadTaskEntry, "MMC5983Read", 1024, NULL,
+        MMC5983ReadTaskEntry, "MMC5983Read", 128, NULL,
         configMAX_PRIORITIES - 6,
         MMC5983ReadTaskStack, &MMC5983ReadTaskTCB);
 
     MMC5983ProcessTaskHandle = xTaskCreateStatic(
-        MMC5983ProcessTaskEntry, "MMC5983Proc", 1024, NULL,
+        MMC5983ProcessTaskEntry, "MMC5983Proc", 128, NULL,
         configMAX_PRIORITIES - 7,
         MMC5983ProcessTaskStack, &MMC5983ProcessTaskTCB);
 
     // --- 辅助：DPS310 气压计 (中等优先级) ---
     DPS310ReadTaskHandle = xTaskCreateStatic(
-        DPS310ReadTaskEntry, "DPS310Read", 1024, NULL,
+        DPS310ReadTaskEntry, "DPS310Read", 128, NULL,
         configMAX_PRIORITIES - 6, // 气压和磁力计同一级别即可
         DPS310ReadTaskStack, &DPS310ReadTaskTCB);
 
     DPS310ProcessTaskHandle = xTaskCreateStatic(
-        DPS310ProcessTaskEntry, "DPS310Proc", 1024, NULL,
+        DPS310ProcessTaskEntry, "DPS310Proc", 128, NULL,
         configMAX_PRIORITIES - 7,
         DPS310ProcessTaskStack, &DPS310ProcessTaskTCB);
 
@@ -7625,6 +8814,7 @@ void SystemSensors_Init_Entry(void *argument)
 
     SystemQueueInit();
     DBG_MON_INIT();
+    AttitudeEstimator_Init();
     // 5. 初始化完毕，释放内存
     vTaskDelete(NULL);
 }

@@ -399,7 +399,7 @@ bool MMC5983::read_mag()
 {
     if (!write_reg(MMC5983_REG_CTRL0, 0x01)) {
         return false;
-    }
+    }//触发单次测量
 
     vTaskDelay(pdMS_TO_TICKS(10));
 

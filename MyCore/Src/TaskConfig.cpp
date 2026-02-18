@@ -1,5 +1,6 @@
 #include "TaskConfig.hpp"
 #include "DebugMonitor.hpp"
+#include "AttitudeESKF.hpp"
 SPIBus spi1_bus(&hspi1);
 SPIBus spi2_bus(&hspi2);
 SPIBus spi3_bus(&hspi3);
@@ -159,6 +160,7 @@ void SystemSensors_Init_Entry(void *argument)
 
     SystemQueueInit();
     DBG_MON_INIT();
+    AttitudeEstimator_Init();
     // 5. 初始化完毕，释放内存
     vTaskDelete(NULL);
 }
