@@ -52,7 +52,7 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(ICM42688GND_GPIO_Port, ICM42688GND_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOE, MOTORGND_Pin|ICM42688GND_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(ICM42688VCC_GPIO_Port, ICM42688VCC_Pin, GPIO_PIN_SET);
@@ -72,8 +72,8 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(MMC5983GND_GPIO_Port, MMC5983GND_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : ICM42688GND_Pin ICM42688VCC_Pin */
-  GPIO_InitStruct.Pin = ICM42688GND_Pin|ICM42688VCC_Pin;
+  /*Configure GPIO pins : MOTORGND_Pin ICM42688GND_Pin ICM42688VCC_Pin */
+  GPIO_InitStruct.Pin = MOTORGND_Pin|ICM42688GND_Pin|ICM42688VCC_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;

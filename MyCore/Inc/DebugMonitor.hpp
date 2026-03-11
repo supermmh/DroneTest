@@ -1,80 +1,104 @@
 #pragma once
 #include "main.h"
-#include "FreeRTOS.h"
-#include "task.h"
-#include "DataStructConfig.hpp"
+#include "DataStructConfig.hpp" 
 
-// ==========================================
-// 调试模式总开关 (设为 0 时，探针被彻底抹除，编译器实现零性能损耗)
-// ==========================================
 #define ENABLE_DEBUG_MONITOR 1
 
-#if ENABLE_DEBUG_MONITOR
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// 任务健康信息结构体
+void DebugMonitor_Init(void);
+void DebugMonitor_RecordAttempt(SensorID_e id);
+void DebugMonitor_RecordSuccess(SensorID_e id);
+void DebugMonitor_RecordError(SensorID_e id);
+
+#ifdef __cplusplus
+} 
+#endif
+
+#ifdef __cplusplus
+void DebugMonitor_RecordAttitudeUpdate(const VehicleState_t *state);
+#endif
+
+#if ENABLE_DEBUG_MONITOR
+#define DBG_MON_INIT()                 DebugMonitor_Init()
+#define DBG_MON_ATTEMPT(id)            DebugMonitor_RecordAttempt(id)
+#define DBG_MON_SUCCESS(id)            DebugMonitor_RecordSuccess(id)
+#define DBG_MON_ERROR(id)              DebugMonitor_RecordError(id)
+#define DBG_MON_ATTITUDE_UPDATE(state) DebugMonitor_RecordAttitudeUpdate(state)
+#else 
+#define DBG_MON_INIT()                 ((void)0)
+#define DBG_MON_ATTEMPT(id)            ((void)0)
+#define DBG_MON_SUCCESS(id)            ((void)0)
+#define DBG_MON_ERROR(id)              ((void)0)
+#define DBG_MON_ATTITUDE_UPDATE(state) ((void)0)
+#endif
+
+#ifdef __cplusplus
+#include "FreeRTOS.h"
+#include "task.h"
+
 struct TaskDebugInfo_t {
     TaskHandle_t handle;
     char taskName[configMAX_TASK_NAME_LEN];
-    uint32_t stackHighWaterMark; // 栈历史最小剩余量 (单位: Word/4字节，接近 0 时说明即将栈溢出)
-    float cpuUsagePercent;       // 过去 1 秒内该任务实际消耗 CPU 算力占比 (%)
-    uint32_t _lastRunTime;       // 内部变量
+    uint32_t stackHighWaterMark; 
+    float cpuUsagePercent;       
+    uint32_t _lastRunTime;       
 };
 
 struct AttitudeDebugInfo_t {
-    uint32_t updateCount;        // 累计完成姿态解算的次数
-    uint32_t updatesPerSecondHz; // 当前解算频率 (Hz，理想情况下应等于 ICM42688 的读取频率)
-    VehicleState_t latestState;  // 最新解算的姿态与位置数据 (便于直接观察Roll/Pitch/Yaw)
-
-    uint32_t _lastUpdateCount; // 内部变量
+    uint32_t updateCount;        
+    uint32_t updatesPerSecondHz; 
+    VehicleState_t latestState;  
+    uint32_t _lastUpdateCount; 
 };
 
-// 传感器健康与状态信息结构体
+struct UartDebugInfo_t {
+    uint32_t rx_valid_frames; 
+    uint32_t tx_frames;       
+    uint32_t err_ore;         
+    uint32_t err_fe;          
+    uint32_t err_ne;          
+    uint32_t err_pe;          
+    uint32_t err_dma;         
+    uint32_t rx_restarts;     
+};
+
 struct SensorDebugInfo_t {
-    uint32_t attempts;          // 尝试发起总线读取的总次数
-    uint32_t successes;         // 成功读取且数据解析有效的总次数
-    uint32_t errors;            // 总线传输失败或数据包无效的次数
-    uint32_t readsPerSecondHz;  // 当前真实的每秒成功读取次数 (即传感器有效运行频率 Hz)
-    float failureRatePercent;   // 累计读取异常失败率 (%)
-    Sensor_Packet_t latestData; // 传感器最新数值 (在调试器直接展开看解析好的数值)
-
-    uint32_t _lastSuccesses; // 内部变量
+    uint32_t attempts;          
+    uint32_t successes;         
+    uint32_t errors;            
+    uint32_t readsPerSecondHz;  
+    float failureRatePercent;   
+    uint32_t _lastSuccesses; 
 };
 
-// 全局 LiveWatch 聚合观测结构体
+// 🌟 专供 ST-Link/J-Link 在 Live Expressions 里观察的原生数据槽位
+struct SensorRawDebug_t {
+    float dps_pressure;
+    float pmw_dx;
+    float pmw_dy;
+    float pmw_squal;
+    float mmc_mag_x;
+    float mmc_mag_y;
+    float mmc_mag_z;
+};
+
 struct SystemDebugMonitor_t {
-    float totalCpuUsage;    // 系统当前整体业务 CPU 占用率
-    uint32_t uptimeSeconds; // 飞控运行时长 (秒)
+    float totalCpuUsage;    
+    uint32_t uptimeSeconds; 
     uint32_t taskCount;
-
     TaskDebugInfo_t tasks[15];
-
     SensorDebugInfo_t icm42688;
     SensorDebugInfo_t pmw3901;
     SensorDebugInfo_t dps310;
     SensorDebugInfo_t mmc5983;
     AttitudeDebugInfo_t attitude;
+    UartDebugInfo_t uart4;
+    
+    SensorRawDebug_t raw_sensors; // 🌟 挂载至全局可见
 };
 
-extern SystemDebugMonitor_t g_DebugMonitor; // Live Watch 观测这个变量
-
-void DebugMonitor_Init();
-void DebugMonitor_RecordAttempt(SensorID_e id);
-void DebugMonitor_RecordSuccess(SensorID_e id, const Sensor_Packet_t *packet);
-void DebugMonitor_RecordError(SensorID_e id);
-void DebugMonitor_RecordAttitudeUpdate(const VehicleState_t *state);
-
-// 给业务逻辑插装的探针宏
-#define DBG_MON_INIT()                 DebugMonitor_Init()
-#define DBG_MON_ATTEMPT(id)            DebugMonitor_RecordAttempt(id)
-#define DBG_MON_SUCCESS(id, packet)    DebugMonitor_RecordSuccess(id, packet)
-#define DBG_MON_ERROR(id)              DebugMonitor_RecordError(id)
-#define DBG_MON_ATTITUDE_UPDATE(state) DebugMonitor_RecordAttitudeUpdate(state)
-#else // 关闭调试监控，实现绝对的零消耗
-
-#define DBG_MON_INIT()                 ((void)0)
-#define DBG_MON_ATTEMPT(id)            ((void)0)
-#define DBG_MON_SUCCESS(id, packet)    ((void)0)
-#define DBG_MON_ERROR(id)              ((void)0)
-#define DBG_MON_ATTITUDE_UPDATE(state) ((void)0)
-
+extern SystemDebugMonitor_t g_DebugMonitor; 
 #endif

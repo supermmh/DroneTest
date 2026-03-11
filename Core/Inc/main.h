@@ -59,6 +59,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define MOTORGND_Pin GPIO_PIN_2
+#define MOTORGND_GPIO_Port GPIOE
 #define ICM42688GND_Pin GPIO_PIN_3
 #define ICM42688GND_GPIO_Port GPIOE
 #define ICM42688VCC_Pin GPIO_PIN_4

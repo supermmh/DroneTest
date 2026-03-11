@@ -1,47 +1,44 @@
 #pragma once
-#include "main.h"
+
+#ifdef __cplusplus
 #include "DataStructConfig.hpp"
 
-#ifdef __cplusplus
-extern "C" {
+#ifndef ARM_MATH_CM7
+#define ARM_MATH_CM7
 #endif
+#ifndef __FPU_PRESENT
+#define __FPU_PRESENT 1U
+#endif
+#include "arm_math.h"
 
-// FreeRTOS 任务入口暴露给 C 环境
-void AttitudeEstimator_Init(void);
-
-#ifdef __cplusplus
-}
-
-class ESKF {
+class ESKF
+{
 public:
     ESKF();
     void Init(float initial_yaw, float initial_alt);
-    
-    // 核心卡尔曼循环
+    void AlignAndCalibrate(const float acc_mean[3], const float gyro_mean[3], float init_yaw);
+
     void PredictIMU(const float acc[3], const float gyro[3], float dt);
-    void UpdateBaro(float alt);
+    void UpdateBaro(float alt, float r_var);
     void UpdateMag(const float mag[3]);
     void UpdateFlow(float flow_dx, float flow_dy, float dt);
     void UpdateAccel(const float acc[3]);
     void UpdateZUPT(void);
     VehicleState_t GetState(uint64_t timestamp);
-
+    void SetStaticBias(const float accel_bias[3], const float gyro_bias[3]);
     float base_baro;
     bool is_inited;
-    
+
 private:
-    float p[3];      // 名义位置 NED
-    float v[3];      // 名义速度 NED
-    float q[4];      // 名义四元数
-    float bg[3];     // 陀螺仪零偏
-    float ba[3];     // 加速度零偏
-    float P[15][15]; // 误差状态协方差矩阵
-    
-    float last_gyro[3]; 
+    float p[3], v[3], q[4], bg[3], ba[3];
+    float last_gyro[3];
+
+    float32_t P_data[225];
+    arm_matrix_instance_f32 P_mat;
 
     void GetRotationMatrix(float Rmat[3][3]);
-    void ScalarUpdate(const float H[15], float y, float R_var);
+    // 🛡️ 新增卡方检验开关，防止正常修正被误杀
+    void ScalarUpdate(const float H[15], float y, float R_var, bool use_chisq = true);
     void InjectError(const float dx[15]);
-    
 };
 #endif

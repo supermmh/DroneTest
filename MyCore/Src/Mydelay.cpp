@@ -1,67 +1,37 @@
 #include "Mydelay.hpp"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "timers.h" // 引入软件定时器
+#include "tim.h"
+extern TIM_HandleTypeDef htim7;
 
-
-static volatile uint32_t s_last_cyccnt = 0;
-static volatile uint64_t s_total_cycles = 0;
-
-static void TimeBase_KeepAlive_Callback(TimerHandle_t xTimer) {
-    (void)xTimer;
-    Get_System_Time_ns(); // 仅仅调用一次，利用其内部机制更新 s_total_cycles
+void DWT_Time_Init(void)
+{
+    // 彻底废弃 DWT！脱机运行时 DWT 极易被内核断钟导致死机！
 }
 
+uint64_t Get_System_Time_ns(void)
+{
+    uint32_t ms1, ms2, us;
 
-void DWT_Time_Init(void) {
-    // 1. 启用 DWT 硬件
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    
-    // 初始化静态变量
-    s_last_cyccnt = DWT->CYCCNT;
-    s_total_cycles = 0;
+    // 无锁防竞态读取：如果在读取微秒的瞬间发生了毫秒进位，引发重新读取
+    do {
+        ms1 = HAL_GetTick();
+        us  = TIM7->CNT; // TIM7 配置的周期恰好是 0~999 微秒
+        ms2 = HAL_GetTick();
+    } while (ms1 != ms2);
 
-    TimerHandle_t hTimer = xTimerCreate(
-        "TimeGuard",             // 名字
-        pdMS_TO_TICKS(4000),     // 周期 4秒 (远小于 8.9秒溢出时间)
-        pdTRUE,                  // 自动重载
-        (void*)0,                // ID
-        TimeBase_KeepAlive_Callback // 回调函数
-    );
+    // ms 是毫秒级，us 是微秒级，完美拼装出 64 位纳秒时间戳！
+    return ((uint64_t)ms1 * 1000000ULL) + ((uint64_t)us * 1000ULL);
+}
 
-    if (hTimer != NULL) {
-        xTimerStart(hTimer, 0); // 启动定时器
+void delay_us(uint32_t us)
+{
+    uint64_t start_ns = Get_System_Time_ns();
+    uint64_t wait_ns  = (uint64_t)us * 1000ULL;
+    uint32_t start_ms = HAL_GetTick();
+
+    while ((Get_System_Time_ns() - start_ns) < wait_ns) {
+        // 终极断路器：如果等了超过预期时间 1 秒钟，强制跳出防死机
+        if (HAL_GetTick() - start_ms > (us / 1000) + 1000) break;
     }
-}
-
-void delay_us(uint32_t us) {
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * (SystemCoreClock / 1000000);
-    while ((DWT->CYCCNT - start) < ticks);
-}
-
-uint64_t Get_System_Time_ns(void) {
-
-    uint32_t isr_mask = portSET_INTERRUPT_MASK_FROM_ISR();
-
-    uint32_t current_cyccnt = DWT->CYCCNT;
-
-    uint32_t delta = current_cyccnt - s_last_cyccnt;
-    
-    s_total_cycles += delta;
-    s_last_cyccnt = current_cyccnt;
-
-    uint64_t cycles_copy = s_total_cycles;
-
-    portCLEAR_INTERRUPT_MASK_FROM_ISR(isr_mask);
-    
-    uint64_t seconds = cycles_copy / SystemCoreClock;         // 整数秒
-    uint64_t fraction = cycles_copy % SystemCoreClock;        // 不足一秒的周期数
-
-    uint64_t time_ns = (seconds * 1000000000ULL) + 
-                       ((fraction * 1000000000ULL) / SystemCoreClock);
-
-    return time_ns;
 }
