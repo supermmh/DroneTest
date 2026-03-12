@@ -82,6 +82,8 @@ void Error_Handler(void);
 #define ICM42688INT_Pin GPIO_PIN_8
 #define ICM42688INT_GPIO_Port GPIOC
 #define ICM42688INT_EXTI_IRQn EXTI9_5_IRQn
+#define MMC5983_SPI_GND_Pin GPIO_PIN_8
+#define MMC5983_SPI_GND_GPIO_Port GPIOA
 #define PMW3901GND_Pin GPIO_PIN_15
 #define PMW3901GND_GPIO_Port GPIOA
 #define ICM42688_Pin GPIO_PIN_10
@@ -92,6 +94,10 @@ void Error_Handler(void);
 #define MMC5983VCC_GPIO_Port GPIOB
 #define MMC5983GND_Pin GPIO_PIN_5
 #define MMC5983GND_GPIO_Port GPIOB
+#define MMC5983_SPI_NCS_Pin GPIO_PIN_9
+#define MMC5983_SPI_NCS_GPIO_Port GPIOB
+#define MMC5983_SPI_VCC_Pin GPIO_PIN_1
+#define MMC5983_SPI_VCC_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
 
